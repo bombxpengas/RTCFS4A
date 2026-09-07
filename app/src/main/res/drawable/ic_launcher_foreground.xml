@@ -1,0 +1,16 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Three offset glitch/scanline bars, like a corrupted image -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,34 h40 v10 h-40 z" />
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M32,49 h48 v10 h-48 z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M20,64 h36 v10 h-36 z" />
+</vector>
