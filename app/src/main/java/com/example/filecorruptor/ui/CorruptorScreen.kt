@@ -16,7 +16,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -41,6 +40,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private data class PickedFile(
@@ -62,11 +62,12 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     var isProcessing by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
 
-    // Bumped by the "Corrupt Again" button so the LaunchedEffect below re-runs
-    // even when no parameter changed — otherwise, since the effect is keyed
-    // on the parameter values, identical params meant identical (cached)
-    // output no matter how many times you asked for a fresh corruption.
-    var rerollTick by remember { mutableStateOf(0) }
+    // Holds the exact bytes a Save is writing, decoupled from the live
+    // preview above — Save always computes a brand-new corruption right
+    // before writing (see the Save button below), rather than reusing
+    // whatever the auto-preview last happened to show.
+    var pendingSaveBytes by remember { mutableStateOf<ByteArray?>(null) }
+    val saveScope = rememberCoroutineScope()
 
     // Once a save location has been picked, Overwrite reuses it silently on
     // every later tap instead of reopening the system Save dialog — this is
@@ -91,7 +92,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     val createDocumentLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("*/*")
     ) { uri: Uri? ->
-        val data = corrupted
+        val data = pendingSaveBytes
         if (uri == null || data == null) return@rememberLauncherForActivityResult
         runCatching {
             context.contentResolver.takePersistableUriPermission(
@@ -102,6 +103,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
         lastSavedUri = uri
         context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(data) }
         savedMessage = "Saved corrupted file."
+        pendingSaveBytes = null
     }
 
     Column(
@@ -203,7 +205,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
             }
 
-            LaunchedEffect(file.bytes, engine.id, currentValues, rerollTick) {
+            LaunchedEffect(file.bytes, engine.id, currentValues) {
                 isProcessing = true
                 delay(120) // debounce rapid slider drags / typing
                 val result = withContext(Dispatchers.Default) {
@@ -211,16 +213,6 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
                 corrupted = result
                 isProcessing = false
-            }
-
-            OutlinedButton(
-                onClick = { rerollTick++ },
-                enabled = !isProcessing,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(Icons.Filled.Refresh, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Corrupt Again")
             }
 
             Row(
@@ -242,19 +234,32 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
 
             Button(
                 onClick = {
-                    val data = corrupted ?: return@Button
-                    val reuse = lastSavedUri
-                    if (overwriteEnabled && reuse != null) {
-                        context.contentResolver.openOutputStream(reuse, "wt")?.use { it.write(data) }
-                        savedMessage = "Saved corrupted file."
-                    } else {
-                        val base = file.name.substringBeforeLast('.', file.name)
-                        val ext = file.name.substringAfterLast('.', "")
-                        val suggested = if (ext.isNotEmpty()) "${base}_corrupted.$ext" else "${base}_corrupted"
-                        createDocumentLauncher.launch(suggested)
+                    // Save always rolls a brand-new corruption right before
+                    // writing — unless a fixed seed is set on the engine, in
+                    // which case a fresh run naturally reproduces the same
+                    // result, which is the point of a fixed seed.
+                    saveScope.launch {
+                        isProcessing = true
+                        val fresh = withContext(Dispatchers.Default) {
+                            CorruptionEngineExecutor.run(file.bytes, engine, currentValues)
+                        }
+                        corrupted = fresh
+                        isProcessing = false
+
+                        val reuse = lastSavedUri
+                        if (overwriteEnabled && reuse != null) {
+                            context.contentResolver.openOutputStream(reuse, "wt")?.use { it.write(fresh) }
+                            savedMessage = "Saved corrupted file."
+                        } else {
+                            pendingSaveBytes = fresh
+                            val base = file.name.substringBeforeLast('.', file.name)
+                            val ext = file.name.substringAfterLast('.', "")
+                            val suggested = if (ext.isNotEmpty()) "${base}_corrupted.$ext" else "${base}_corrupted"
+                            createDocumentLauncher.launch(suggested)
+                        }
                     }
                 },
-                enabled = corrupted != null,
+                enabled = !isProcessing,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Filled.Save, contentDescription = null)

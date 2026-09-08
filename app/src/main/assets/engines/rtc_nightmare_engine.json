@@ -1,0 +1,163 @@
+{
+  "id": "rtc_nightmare_engine",
+  "name": "RTC Nightmare Engine",
+  "description": "Ported from RTCV's real RTC_NightmareEngine.GenerateUnit. Random: every blast writes a brand-new random value. RandomTilt: each blast randomly writes a new value, adds 1, or subtracts 1 from what's already there. Tilt: each blast randomly adds 1 or subtracts 1. The address alignment math (safeAddress + its out-of-range clamp) is copied directly from RTCV's source, and is genuinely different from the Vector Engine's own clamp formula.",
+  "author": "Ported from RTCV (RTC_NightmareEngine.cs) for RTCFS4A",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "algo",
+      "label": "Algorithm",
+      "type": "dropdown",
+      "options": ["Random", "RandomTilt", "Tilt"],
+      "default": "Random",
+      "description": "Random: always writes a new value. RandomTilt: new value, +1, or -1, chosen randomly each blast. Tilt: +1 or -1, chosen randomly each blast."
+    },
+    {
+      "id": "precision",
+      "label": "Precision (bytes)",
+      "type": "dropdown",
+      "options": ["1", "2", "4", "8"],
+      "default": "4",
+      "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit."
+    },
+    {
+      "id": "min8", "label": "Min Value (8-bit)", "type": "number",
+      "min": 0, "max": 255, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+    },
+    {
+      "id": "max8", "label": "Max Value (8-bit)", "type": "number",
+      "min": 0, "max": 255, "step": 1, "default": "255",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+    },
+    {
+      "id": "min16", "label": "Min Value (16-bit)", "type": "number",
+      "min": 0, "max": 65535, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+    },
+    {
+      "id": "max16", "label": "Max Value (16-bit)", "type": "number",
+      "min": 0, "max": 65535, "step": 1, "default": "65535",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+    },
+    {
+      "id": "min32", "label": "Min Value (32-bit)", "type": "number",
+      "min": 0, "max": 4294967295, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+    },
+    {
+      "id": "max32", "label": "Max Value (32-bit)", "type": "number",
+      "min": 0, "max": 4294967295, "step": 1, "default": "4294967295",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+    },
+    {
+      "id": "min64", "label": "Min Value (64-bit)", "type": "number",
+      "min": 0, "max": 18446744073709551615, "step": 1, "default": "0",
+      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand (the input box can't represent every one of the ~1.8x10^19 possible values exactly) — the default full range is exact until you touch it.",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+    },
+    {
+      "id": "max64", "label": "Max Value (64-bit)", "type": "number",
+      "min": 0, "max": 18446744073709551615, "step": 1, "default": "18446744073709551615",
+      "description": "Same precision caveat as Min Value (64-bit) above.",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+    },
+    {
+      "id": "iterations",
+      "label": "Blast Count",
+      "type": "slider",
+      "min": 1,
+      "max": 1000000,
+      "step": 1,
+      "default": "200",
+      "unit": " blasts",
+      "description": "How many random operations to perform. Use the number box next to the slider for exact values."
+    },
+    {
+      "id": "alignment",
+      "label": "Alignment",
+      "type": "number",
+      "min": 0,
+      "max": 63,
+      "step": 1,
+      "default": "0",
+      "description": "Sub-offset added after rounding down to Precision: safeAddress = address - (address % precision) + alignment."
+    },
+    {
+      "id": "rangeStart",
+      "label": "Start Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (right after Header Size below)."
+    },
+    {
+      "id": "rangeEnd",
+      "label": "End Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (end of file)."
+    },
+    {
+      "id": "headerSize",
+      "label": "Header Size",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "16",
+      "unit": "bytes",
+      "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds, 512 for headered .smc, 0 for a headerless ROM."
+    },
+    {
+      "id": "bigEndian",
+      "label": "Big Endian",
+      "type": "switch",
+      "default": "false",
+      "description": "Byte order for multi-byte writes and tilts."
+    },
+    {
+      "id": "useSeed",
+      "label": "Use Fixed Seed",
+      "type": "switch",
+      "default": "false",
+      "description": "Reuse the same seed to reproduce identical corruption on identical input."
+    },
+    {
+      "id": "seed",
+      "label": "Seed",
+      "type": "number",
+      "min": 0,
+      "max": 999999999,
+      "step": 1,
+      "default": "1",
+      "visibleWhenParam": "useSeed",
+      "visibleWhenValues": ["true"]
+    }
+  ],
+  "operations": [
+    {
+      "type": "nightmare_engine",
+      "params": {
+        "algo": "algo",
+        "precision": "precision",
+        "alignment": "alignment",
+        "iterations": "iterations",
+        "rangeStart": "rangeStart",
+        "rangeEnd": "rangeEnd",
+        "headerSize": "headerSize",
+        "bigEndian": "bigEndian",
+        "min8": "min8", "max8": "max8",
+        "min16": "min16", "max16": "max16",
+        "min32": "min32", "max32": "max32",
+        "min64": "min64", "max64": "max64"
+      }
+    }
+  ]
+}

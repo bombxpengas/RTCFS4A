@@ -8,12 +8,13 @@
     {
       "id": "iterations",
       "label": "Blast Count",
-      "type": "number",
+      "type": "slider",
       "min": 1,
       "max": 1000000,
       "step": 1,
       "default": "200",
-      "description": "How many random 32-bit writes to perform. RTCV normally does one of these per engine tick for as long as corruption is live; this bakes that many ticks into one pass."
+      "unit": " blasts",
+      "description": "How many random 32-bit writes to perform. RTCV normally does one of these per engine tick for as long as corruption is live; this bakes that many ticks into one pass. Use the number box next to the slider for exact values."
     },
     {
       "id": "precision",

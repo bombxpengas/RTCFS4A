@@ -52,6 +52,14 @@ object CorruptionEngineExecutor {
         return values[paramId]?.asBoolean() ?: default
     }
 
+    /** For the Nightmare Engine's 8/16/32/64-bit min/max bounds, which can
+     *  exceed what Double (used by resolveDouble/asDouble) can represent
+     *  exactly — read the raw declared string as an unsigned 64-bit value. */
+    private fun resolveULong(op: OperationDef, argName: String, values: Map<String, ParamValue>, default: ULong): ULong {
+        val paramId = op.params[argName] ?: return default
+        return values[paramId]?.raw?.toULongOrNull() ?: default
+    }
+
     private fun applyOperation(buf: ByteArray, op: OperationDef, values: Map<String, ParamValue>, random: Random) {
         val skip = resolveInt(op, "skipBytes", values, 0).coerceIn(0, buf.size)
         val intensityPct = (resolveDouble(op, "intensity", values, 15.0) / 100.0).coerceIn(0.0, 1.0)
@@ -99,6 +107,26 @@ object CorruptionEngineExecutor {
                 bigEndian = resolveBool(op, "bigEndian", values, false),
                 useValueList = resolveBool(op, "useValueList", values, false),
                 valueListText = resolveString(op, "valueList", values, ""),
+                r = random
+            )
+            "nightmare_engine" -> nightmareEngine(
+                buf,
+                algo = resolveString(op, "algo", values, "Random"),
+                precision = resolveInt(op, "precision", values, 4),
+                alignment = resolveInt(op, "alignment", values, 0),
+                iterations = resolveInt(op, "iterations", values, 200),
+                rangeStart = resolveInt(op, "rangeStart", values, -1),
+                rangeEnd = resolveInt(op, "rangeEnd", values, -1),
+                headerSize = resolveInt(op, "headerSize", values, 0),
+                bigEndian = resolveBool(op, "bigEndian", values, false),
+                min8 = resolveULong(op, "min8", values, 0UL),
+                max8 = resolveULong(op, "max8", values, 0xFFUL),
+                min16 = resolveULong(op, "min16", values, 0UL),
+                max16 = resolveULong(op, "max16", values, 0xFFFFUL),
+                min32 = resolveULong(op, "min32", values, 0UL),
+                max32 = resolveULong(op, "max32", values, 0xFFFFFFFFUL),
+                min64 = resolveULong(op, "min64", values, 0UL),
+                max64 = resolveULong(op, "max64", values, ULong.MAX_VALUE),
                 r = random
             )
             else -> {
@@ -414,5 +442,128 @@ object CorruptionEngineExecutor {
             buf[offset + 2] = ((value ushr 16) and 0xFF).toByte()
             buf[offset + 3] = ((value ushr 24) and 0xFF).toByte()
         }
+    }
+
+    /**
+     * Ported from RTCV's real RTC_NightmareEngine.GenerateUnit. Each blast
+     * rolls an operation according to [algo] (mirroring the Algo switch):
+     * "Random" always SETs a brand-new value; "RandomTilt" randomly SETs,
+     * ADDs 1, or SUBTRACTs 1; "Tilt" randomly ADDs or SUBTRACTs 1 — same
+     * three-way and two-way random branches as RtcCore.RND.Next(1,4) /
+     * Next(1,3) in the original. The address math (safeAddress + the
+     * out-of-range clamp) is copied from that source too, and is genuinely
+     * different from the Vector Engine's — Nightmare's clamp uses precision
+     * where Vector's uses alignment, so they're not interchangeable.
+     *
+     * Adapted for a static file the same way as the Vector Engine: no
+     * "domain" (only one, the file), and the Min/Max8/16/32/64Bit bounds
+     * are plain parameters instead of a shared runtime spec. SET without a
+     * standard precision (not 1/2/4/8) falls back to fully independent
+     * random bytes, same as the original's "def" branch — not reachable
+     * through this app's dropdown, but kept for fidelity.
+     */
+    private fun nightmareEngine(
+        buf: ByteArray,
+        algo: String,
+        precision: Int,
+        alignment: Int,
+        iterations: Int,
+        rangeStart: Int,
+        rangeEnd: Int,
+        headerSize: Int,
+        bigEndian: Boolean,
+        min8: ULong, max8: ULong,
+        min16: ULong, max16: ULong,
+        min32: ULong, max32: ULong,
+        min64: ULong, max64: ULong,
+        r: Random
+    ) {
+        if (buf.isEmpty() || iterations <= 0) return
+        val prec = precision.coerceAtLeast(1)
+        if (buf.size < prec) return
+        val align = alignment.coerceAtLeast(0)
+        val header = headerSize.coerceIn(0, buf.size)
+
+        val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
+        val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
+        if (end - start < prec) return
+
+        val algoKey = algo.trim().lowercase()
+
+        repeat(iterations) {
+            // --- exact port of the Algo switch begins ---
+            val type = when (algoKey) {
+                "randomtilt" -> when (r.nextInt(1, 4)) { // RtcCore.RND.Next(1,4): 1..3
+                    1 -> "add"
+                    2 -> "subtract"
+                    else -> "set"
+                }
+                "tilt" -> if (r.nextInt(1, 3) == 1) "add" else "subtract" // Next(1,3): 1..2
+                else -> "set" // "random"
+            }
+            // --- end port ---
+
+            val address = start + r.nextInt(end - start)
+
+            // --- exact port of RTC_NightmareEngine.GenerateUnit's address math ---
+            var safeAddress = address - (address % prec) + align
+            if (safeAddress > end - prec && end > prec) {
+                safeAddress = end - (2 * prec) + align
+            }
+            // --- end port ---
+
+            if (safeAddress < start || safeAddress < 0 || safeAddress + prec > end || safeAddress + prec > buf.size) {
+                return@repeat
+            }
+
+            when (type) {
+                "set" -> {
+                    when (prec) {
+                        1 -> writeUnsignedBytes(buf, safeAddress, 1, randomULongInRange(r, min8, max8), bigEndian)
+                        2 -> writeUnsignedBytes(buf, safeAddress, 2, randomULongInRange(r, min16, max16), bigEndian)
+                        4 -> writeUnsignedBytes(buf, safeAddress, 4, randomULongInRange(r, min32, max32), bigEndian)
+                        8 -> writeUnsignedBytes(buf, safeAddress, 8, randomULongInRange(r, min64, max64), bigEndian)
+                        else -> for (i in 0 until prec) buf[safeAddress + i] = r.nextInt(256).toByte() // ported "def" fallback
+                    }
+                }
+                "add" -> tiltValue(buf, safeAddress, prec, bigEndian, +1)
+                "subtract" -> tiltValue(buf, safeAddress, prec, bigEndian, -1)
+            }
+        }
+    }
+
+    /** Uniformly-ish random ULong in [min, max] inclusive (min > max is treated as just min). */
+    private fun randomULongInRange(r: Random, min: ULong, max: ULong): ULong {
+        if (min >= max) return min
+        val span = max - min
+        val hi = (r.nextInt().toLong() and 0xFFFFFFFFL)
+        val lo = (r.nextInt().toLong() and 0xFFFFFFFFL)
+        val raw = ((hi shl 32) or lo).toULong()
+        return if (span == ULong.MAX_VALUE) raw else min + (raw % (span + 1UL))
+    }
+
+    /** Writes [size] bytes (1/2/4/8) of [value] at [offset], honoring byte order. */
+    private fun writeUnsignedBytes(buf: ByteArray, offset: Int, size: Int, value: ULong, bigEndian: Boolean) {
+        for (i in 0 until size) {
+            val shift = if (bigEndian) (size - 1 - i) * 8 else i * 8
+            buf[offset + i] = ((value shr shift) and 0xFFUL).toByte()
+        }
+    }
+
+    /** Reads the existing [size]-byte value at [offset], adds [delta] (wrapping within that bit-width), writes it back. */
+    private fun tiltValue(buf: ByteArray, offset: Int, size: Int, bigEndian: Boolean, delta: Int) {
+        var current = 0UL
+        for (i in 0 until size) {
+            val b = (buf[offset + i].toInt() and 0xFF).toULong()
+            val shift = if (bigEndian) (size - 1 - i) * 8 else i * 8
+            current = current or (b shl shift)
+        }
+        val bits = size * 8
+        val mask = if (bits >= 64) ULong.MAX_VALUE else (1UL shl bits) - 1UL
+        // delta.toLong().toULong() reinterprets -1 as 0xFFFF...FFFF, so adding
+        // it is the same as subtracting 1, mod 2^64 — masking then truncates
+        // that correctly down to the size's own bit width.
+        val updated = (current + delta.toLong().toULong()) and mask
+        writeUnsignedBytes(buf, offset, size, updated, bigEndian)
     }
 }
