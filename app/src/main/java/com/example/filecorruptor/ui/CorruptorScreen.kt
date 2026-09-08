@@ -61,6 +61,12 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     var isProcessing by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
 
+    // Once a save location has been picked, Overwrite reuses it silently on
+    // every later tap instead of reopening the system Save dialog — this is
+    // what makes rapid "tweak a param, save, tweak again" iteration fast.
+    var overwriteEnabled by remember { mutableStateOf(true) }
+    var lastSavedUri by remember { mutableStateOf<Uri?>(null) }
+
     val openDocumentLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -72,6 +78,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
         picked = PickedFile(uri, name, bytes, isImage)
         corrupted = null
         savedMessage = null
+        lastSavedUri = null // a new source file means a fresh save target
     }
 
     val createDocumentLauncher = rememberLauncherForActivityResult(
@@ -79,7 +86,14 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     ) { uri: Uri? ->
         val data = corrupted
         if (uri == null || data == null) return@rememberLauncherForActivityResult
-        context.contentResolver.openOutputStream(uri)?.use { it.write(data) }
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        }
+        lastSavedUri = uri
+        context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(data) }
         savedMessage = "Saved corrupted file."
     }
 
@@ -192,19 +206,43 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 isProcessing = false
             }
 
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Overwrite last saved file", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+                    Text(
+                        if (lastSavedUri == null) "Next save will ask where to put it, then reuse that spot."
+                        else "Saving now writes straight back to the same file — no dialog.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = overwriteEnabled, onCheckedChange = { overwriteEnabled = it })
+            }
+
             Button(
                 onClick = {
-                    val base = file.name.substringBeforeLast('.', file.name)
-                    val ext = file.name.substringAfterLast('.', "")
-                    val suggested = if (ext.isNotEmpty()) "${base}_corrupted.$ext" else "${base}_corrupted"
-                    createDocumentLauncher.launch(suggested)
+                    val data = corrupted ?: return@Button
+                    val reuse = lastSavedUri
+                    if (overwriteEnabled && reuse != null) {
+                        context.contentResolver.openOutputStream(reuse, "wt")?.use { it.write(data) }
+                        savedMessage = "Saved corrupted file."
+                    } else {
+                        val base = file.name.substringBeforeLast('.', file.name)
+                        val ext = file.name.substringAfterLast('.', "")
+                        val suggested = if (ext.isNotEmpty()) "${base}_corrupted.$ext" else "${base}_corrupted"
+                        createDocumentLauncher.launch(suggested)
+                    }
                 },
                 enabled = corrupted != null,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Filled.Save, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("Save corrupted file")
+                Text(if (overwriteEnabled && lastSavedUri != null) "Save (overwrite)" else "Save corrupted file")
             }
 
             savedMessage?.let {
