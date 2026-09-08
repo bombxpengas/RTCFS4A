@@ -88,6 +88,19 @@ object CorruptionEngineExecutor {
                 find = resolveString(op, "find", values, ""),
                 replaceWith = resolveString(op, "replace", values, "")
             )
+            "vector_engine" -> vectorEngine(
+                buf,
+                precision = resolveInt(op, "precision", values, 4),
+                alignment = resolveInt(op, "alignment", values, 0),
+                iterations = resolveInt(op, "iterations", values, 200),
+                rangeStart = resolveInt(op, "rangeStart", values, -1),
+                rangeEnd = resolveInt(op, "rangeEnd", values, -1),
+                headerSize = resolveInt(op, "headerSize", values, 0),
+                bigEndian = resolveBool(op, "bigEndian", values, false),
+                useValueList = resolveBool(op, "useValueList", values, false),
+                valueListText = resolveString(op, "valueList", values, ""),
+                r = random
+            )
             else -> {
                 // Unknown primitive (e.g. a custom engine referencing a type
                 // this app version doesn't implement yet): skip it rather than
@@ -310,6 +323,96 @@ object CorruptionEngineExecutor {
             } else {
                 i++
             }
+        }
+    }
+
+    /**
+     * Ported from RTCV's real RTC_VectorEngine.GenerateUnit — the address
+     * math below (safeAddress / out-of-range clamp) is copied line-for-line
+     * from that C# source, not reinvented. What's adapted for a static file
+     * instead of a live BizHawk memory domain:
+     *  - "domain" doesn't apply — there's only one domain, the file itself.
+     *  - LimiterList (a curated per-game address allow-list) becomes the
+     *    generic [rangeStart]/[rangeEnd] this app already uses elsewhere —
+     *    we don't have RTCV's per-game filter database, so the user-supplied
+     *    range is the closest equivalent "only corrupt here" restriction.
+     *  - ValueList (a curated per-game pool of "safe" constants, matched
+     *    against the original bytes via GetRandomConstant) becomes an
+     *    optional user-supplied hex list ([valueListText]); with it off, a
+     *    uniformly random 32-bit value is used instead, since we don't have
+     *    RTCV's shipped value-list database to draw from.
+     *  - UnlockPrecision/CachedPrecision (BizHawk-reported bus width) becomes
+     *    a plain [precision] number the person sets directly — functionally
+     *    the same as always running "unlocked" with an explicit value.
+     * The original runs GenerateUnit once per engine tick for as long as
+     * corruption is engaged live; [iterations] is how many of those ticks'
+     * worth of writes to bake into this one-shot file transform.
+     */
+    private fun vectorEngine(
+        buf: ByteArray,
+        precision: Int,
+        alignment: Int,
+        iterations: Int,
+        rangeStart: Int,
+        rangeEnd: Int,
+        headerSize: Int,
+        bigEndian: Boolean,
+        useValueList: Boolean,
+        valueListText: String,
+        r: Random
+    ) {
+        if (buf.size < 4 || iterations <= 0) return
+        val precisionSafe = precision.coerceAtLeast(1)
+        val align = alignment.coerceAtLeast(0)
+        val header = headerSize.coerceIn(0, buf.size)
+
+        val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
+        val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
+        if (end - start < 4) return
+
+        val pool = if (useValueList) parseHexValueList(valueListText) else null
+
+        repeat(iterations) {
+            // Stand-in for RTCV picking a live memory address to consider —
+            // here, any raw offset inside our allowed range.
+            val address = start + r.nextInt(end - start)
+
+            // --- exact port of RTC_VectorEngine.GenerateUnit begins ---
+            var safeAddress = address - (address % precisionSafe) + align // 32-bit trunc
+            if (safeAddress > end - align) {
+                safeAddress = end - (2 * align) + align // out of range: hit the last aligned address
+            }
+            // --- exact port ends ---
+
+            // Safety net the original doesn't need (its MemoryInterface
+            // handles bounds itself): never write outside our own range/buffer.
+            if (safeAddress < start || safeAddress < 0 || safeAddress + 4 > end || safeAddress + 4 > buf.size) {
+                return@repeat
+            }
+
+            val value = pool?.takeIf { it.isNotEmpty() }?.let { it[r.nextInt(it.size)] } ?: r.nextInt()
+            writeInt32(buf, safeAddress, value, bigEndian)
+        }
+    }
+
+    /** Parses a comma/space/newline separated list of hex 32-bit constants, e.g. "DEADBEEF, 0x1234ABCD". */
+    private fun parseHexValueList(text: String): List<Int> =
+        text.split(',', ' ', '\n', '\t', '\r')
+            .map { it.trim().removePrefix("0x").removePrefix("0X") }
+            .filter { it.isNotEmpty() }
+            .mapNotNull { it.toLongOrNull(16)?.toInt() }
+
+    private fun writeInt32(buf: ByteArray, offset: Int, value: Int, bigEndian: Boolean) {
+        if (bigEndian) {
+            buf[offset] = ((value ushr 24) and 0xFF).toByte()
+            buf[offset + 1] = ((value ushr 16) and 0xFF).toByte()
+            buf[offset + 2] = ((value ushr 8) and 0xFF).toByte()
+            buf[offset + 3] = (value and 0xFF).toByte()
+        } else {
+            buf[offset] = (value and 0xFF).toByte()
+            buf[offset + 1] = ((value ushr 8) and 0xFF).toByte()
+            buf[offset + 2] = ((value ushr 16) and 0xFF).toByte()
+            buf[offset + 3] = ((value ushr 24) and 0xFF).toByte()
         }
     }
 }
