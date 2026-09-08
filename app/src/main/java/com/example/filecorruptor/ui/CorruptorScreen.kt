@@ -16,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -60,6 +61,12 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     var corrupted by remember { mutableStateOf<ByteArray?>(null) }
     var isProcessing by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
+
+    // Bumped by the "Corrupt Again" button so the LaunchedEffect below re-runs
+    // even when no parameter changed — otherwise, since the effect is keyed
+    // on the parameter values, identical params meant identical (cached)
+    // output no matter how many times you asked for a fresh corruption.
+    var rerollTick by remember { mutableStateOf(0) }
 
     // Once a save location has been picked, Overwrite reuses it silently on
     // every later tap instead of reopening the system Save dialog — this is
@@ -196,7 +203,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
             }
 
-            LaunchedEffect(file.bytes, engine.id, currentValues) {
+            LaunchedEffect(file.bytes, engine.id, currentValues, rerollTick) {
                 isProcessing = true
                 delay(120) // debounce rapid slider drags / typing
                 val result = withContext(Dispatchers.Default) {
@@ -204,6 +211,16 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
                 corrupted = result
                 isProcessing = false
+            }
+
+            OutlinedButton(
+                onClick = { rerollTick++ },
+                enabled = !isProcessing,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Filled.Refresh, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Corrupt Again")
             }
 
             Row(
