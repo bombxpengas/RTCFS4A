@@ -32,6 +32,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.filecorruptor.engine.CorruptionEngineExecutor
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.engine.ParamValue
+import com.example.filecorruptor.engine.isVisible
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -163,11 +169,17 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
 
             Text("Parameters", style = MaterialTheme.typography.titleMedium)
             engine.parameters.filterNot { it.hidden }.forEach { def ->
-                ParameterControl(
-                    def = def,
-                    value = engineValues[def.id] ?: ParamValue(def.default),
-                    onValueChange = { engineValues[def.id] = it }
-                )
+                AnimatedVisibility(
+                    visible = def.isVisible(currentValues),
+                    enter = fadeIn() + expandVertically(),
+                    exit = fadeOut() + shrinkVertically()
+                ) {
+                    ParameterControl(
+                        def = def,
+                        value = engineValues[def.id] ?: ParamValue(def.default),
+                        onValueChange = { engineValues[def.id] = it }
+                    )
+                }
             }
 
             LaunchedEffect(file.bytes, engine.id, currentValues) {

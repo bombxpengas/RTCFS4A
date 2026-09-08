@@ -21,6 +21,10 @@ object EngineJson {
             val p = paramsArr.getJSONObject(i)
             val optionsArr = p.optJSONArray("options")
             val options = if (optionsArr != null) (0 until optionsArr.length()).map { optionsArr.getString(it) } else emptyList()
+            val visibleWhenValuesArr = p.optJSONArray("visibleWhenValues")
+            val visibleWhenValues = if (visibleWhenValuesArr != null) {
+                (0 until visibleWhenValuesArr.length()).map { visibleWhenValuesArr.getString(it) }
+            } else emptyList()
             params += ParameterDef(
                 id = p.getString("id"),
                 label = p.optString("label", p.getString("id")),
@@ -32,7 +36,9 @@ object EngineJson {
                 unit = p.optString("unit", ""),
                 options = options,
                 description = p.optString("description", ""),
-                hidden = p.optBoolean("hidden", false)
+                hidden = p.optBoolean("hidden", false),
+                visibleWhenParam = p.optString("visibleWhenParam", "").ifBlank { null },
+                visibleWhenValues = visibleWhenValues
             )
         }
 

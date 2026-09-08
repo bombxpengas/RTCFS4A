@@ -19,7 +19,16 @@ data class ParameterDef(
     val description: String = "",
     /** Hidden parameters still hold a value and can be bound by operations,
      *  but render no UI control — useful for fixed internal constants. */
-    val hidden: Boolean = false
+    val hidden: Boolean = false,
+    /**
+     * If set, this control is only shown while the parameter named here
+     * currently holds one of [visibleWhenValues] — e.g. "Replace From" only
+     * shown while "mode" == "Replace". Null means always visible. This lets
+     * an engine swap which controls are relevant as a dropdown/mode choice
+     * changes, instead of showing every field for every mode at once.
+     */
+    val visibleWhenParam: String? = null,
+    val visibleWhenValues: List<String> = emptyList()
 )
 
 enum class ParamType { SLIDER, SWITCH, NUMBER, DROPDOWN, TEXT }
@@ -75,3 +84,10 @@ data class ParamValue(val raw: String) {
 
 fun EngineDefinition.defaultValues(): Map<String, ParamValue> =
     parameters.associate { it.id to ParamValue(it.default) }
+
+/** Whether this control should currently render, given the engine's live parameter values. */
+fun ParameterDef.isVisible(values: Map<String, ParamValue>): Boolean {
+    val condParam = visibleWhenParam ?: return true
+    val current = values[condParam]?.asString() ?: return true
+    return visibleWhenValues.isEmpty() || current in visibleWhenValues
+}

@@ -1,17 +1,10 @@
 {
   "id": "vinesauce_rom_corruptor",
   "name": "Vinesauce ROM Corruptor",
-  "description": "The exact deterministic engine from the standalone ROM Corruptor app: Add/Shift/Replace a byte value, walking the file at a configurable stride (Increment) and only actually corrupting every Nth visited byte (Frequency) — two separate knobs, not aliases of each other. Start/End of -1 means auto (just past the header / end of file). Includes NES CPU-jam protection and an independent literal text find/replace pass, each with its own on/off switch.",
+  "description": "The exact deterministic engine from the standalone ROM Corruptor app: Add/Shift/Replace a byte value, walking the file at a configurable stride (Increment) and only actually corrupting every Nth visited byte (Frequency) — two separate knobs, not aliases of each other. Start/End of -1 means auto (just past the header / end of file). Includes NES CPU-jam protection.",
   "author": "Recreated for RTCFS4A",
-  "version": "1.0",
+  "version": "1.1",
   "parameters": [
-    {
-      "id": "byteCorruptionEnabled",
-      "label": "Enable Byte Corruption",
-      "type": "switch",
-      "default": "true",
-      "description": "Turn off if you only want Text Find/Replace below, without also scrambling the rest of the file."
-    },
     {
       "id": "mode",
       "label": "Corruption Mode",
@@ -28,7 +21,33 @@
       "max": 255,
       "step": 1,
       "default": "1",
-      "description": "Used by Add and Shift modes. Shift only meaningfully differs across -7..7 (it wraps every 8)."
+      "description": "Used by Add and Shift modes. Shift only meaningfully differs across -7..7 (it wraps every 8).",
+      "visibleWhenParam": "mode",
+      "visibleWhenValues": ["Add", "Shift"]
+    },
+    {
+      "id": "replaceFrom",
+      "label": "Replace From",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "0",
+      "description": "Decimal 0-255 (e.g. 234 = 0xEA). Every byte equal to this gets replaced.",
+      "visibleWhenParam": "mode",
+      "visibleWhenValues": ["Replace"]
+    },
+    {
+      "id": "replaceTo",
+      "label": "Replace To",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "255",
+      "description": "Decimal 0-255. What matching bytes get replaced with.",
+      "visibleWhenParam": "mode",
+      "visibleWhenValues": ["Replace"]
     },
     {
       "id": "increment",
@@ -58,7 +77,6 @@
       "max": 100000000,
       "step": 1,
       "default": "-1",
-      "unit": "",
       "description": "-1 = auto (right after Header Size below). An explicit value here always overrides the header, even to deliberately corrupt it."
     },
     {
@@ -83,58 +101,16 @@
       "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds (iNES/fwNES header), 512 for headered .smc, 0 for a headerless ROM."
     },
     {
-      "id": "replaceFrom",
-      "label": "Replace From",
-      "type": "number",
-      "min": 0,
-      "max": 255,
-      "step": 1,
-      "default": "0",
-      "description": "Replace mode only. Decimal 0-255 (e.g. 234 = 0xEA)."
-    },
-    {
-      "id": "replaceTo",
-      "label": "Replace To",
-      "type": "number",
-      "min": 0,
-      "max": 255,
-      "step": 1,
-      "default": "255",
-      "description": "Replace mode only. Decimal 0-255."
-    },
-    {
       "id": "avoidNesCpuJam",
       "label": "Avoid NES CPU-Jam Opcodes",
       "type": "switch",
       "default": "false",
       "description": "Skips writing a corrupted byte if it would land on one of the 6502's KIL/JAM opcodes, which otherwise freeze the game solid instead of glitching it."
-    },
-    {
-      "id": "useTextReplace",
-      "label": "Enable Text Find/Replace",
-      "type": "switch",
-      "default": "false",
-      "description": "Independent pass: swaps one literal text string for another anywhere in the file."
-    },
-    {
-      "id": "textFind",
-      "label": "Find Text",
-      "type": "text",
-      "default": "",
-      "description": "Case-sensitive, literal text to search for (e.g. Mario)."
-    },
-    {
-      "id": "textReplace",
-      "label": "Replace With",
-      "type": "text",
-      "default": "",
-      "description": "Should be the same length as Find Text — it's padded or truncated to match so the file's size never changes (e.g. Mario -> LUIGI, both 5 letters)."
     }
   ],
   "operations": [
     {
       "type": "byte_corrupt",
-      "enabledParam": "byteCorruptionEnabled",
       "params": {
         "mode": "mode",
         "amount": "amount",
@@ -146,14 +122,6 @@
         "replaceFrom": "replaceFrom",
         "replaceTo": "replaceTo",
         "avoidNesCpuJam": "avoidNesCpuJam"
-      }
-    },
-    {
-      "type": "text_replace_literal",
-      "enabledParam": "useTextReplace",
-      "params": {
-        "find": "textFind",
-        "replace": "textReplace"
       }
     }
   ]
