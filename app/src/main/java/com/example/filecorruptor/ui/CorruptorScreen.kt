@@ -5,27 +5,33 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.BrokenImage
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.example.filecorruptor.corruptor.CorruptionMode
-import com.example.filecorruptor.corruptor.CorruptionSettings
-import com.example.filecorruptor.corruptor.FileCorruptor
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.filecorruptor.engine.CorruptionEngineExecutor
+import com.example.filecorruptor.engine.EngineViewModel
+import com.example.filecorruptor.engine.ParamValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -37,16 +43,15 @@ private data class PickedFile(
     val isImage: Boolean
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CorruptorScreen() {
+fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     val context = LocalContext.current
+    val engines by engineViewModel.engines.collectAsState()
+    val selectedEngineId by engineViewModel.selectedEngineId.collectAsState()
+    val selectedEngine = engines.firstOrNull { it.id == selectedEngineId }
+
     var picked by remember { mutableStateOf<PickedFile?>(null) }
     var corrupted by remember { mutableStateOf<ByteArray?>(null) }
-    var mode by remember { mutableStateOf(CorruptionMode.RANDOM_BYTES) }
-    var intensity by remember { mutableFloatStateOf(0.15f) }
-    var preserveHeader by remember { mutableStateOf(true) }
-    var chunkSize by remember { mutableFloatStateOf(256f) }
     var isProcessing by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
 
@@ -54,12 +59,10 @@ fun CorruptorScreen() {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        val resolver = context.contentResolver
-        val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: return@rememberLauncherForActivityResult
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: return@rememberLauncherForActivityResult
         val name = queryDisplayName(context, uri) ?: "selected_file"
-        val isImage = runCatching {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null
-        }.getOrDefault(false)
+        val isImage = runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null }.getOrDefault(false)
         picked = PickedFile(uri, name, bytes, isImage)
         corrupted = null
         savedMessage = null
@@ -74,24 +77,6 @@ fun CorruptorScreen() {
         savedMessage = "Saved corrupted file."
     }
 
-    // Debounced live re-corruption whenever settings or source file change.
-    LaunchedEffect(picked, mode, intensity, preserveHeader, chunkSize) {
-        val src = picked ?: return@LaunchedEffect
-        isProcessing = true
-        delay(120) // debounce rapid slider drags
-        val settings = CorruptionSettings(
-            mode = mode,
-            intensity = intensity,
-            preserveHeaderBytes = if (preserveHeader) minOf(128, src.bytes.size) else 0,
-            chunkSize = chunkSize.toInt().coerceAtLeast(16)
-        )
-        val result = withContext(Dispatchers.Default) {
-            FileCorruptor.corrupt(src.bytes, settings)
-        }
-        corrupted = result
-        isProcessing = false
-    }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -99,15 +84,40 @@ fun CorruptorScreen() {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        Text("Corruptor", style = MaterialTheme.typography.headlineMedium)
         Text(
-            "Real-Time Corruptor",
-            style = MaterialTheme.typography.headlineMedium
-        )
-        Text(
-            "Pick a file and mangle its bytes live. Great for glitch art, memes, or testing how apps handle broken files.",
+            "Pick a file and an engine, then dial in exact parameters — every value here can be typed precisely, not just dragged.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        Text("Engine", style = MaterialTheme.typography.titleMedium)
+        if (engines.isEmpty()) {
+            Text(
+                "No engines installed yet.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(engines) { engine ->
+                    FilterChip(
+                        selected = engine.id == selectedEngineId,
+                        onClick = { engineViewModel.selectEngine(engine.id) },
+                        label = { Text(engine.name) }
+                    )
+                }
+            }
+            selectedEngine?.let {
+                if (it.description.isNotBlank()) {
+                    Text(
+                        it.description,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
 
         FilledTonalButton(
             onClick = { openDocumentLauncher.launch(arrayOf("*/*")) },
@@ -118,7 +128,9 @@ fun CorruptorScreen() {
             Text(if (picked == null) "Select a file" else "Change file")
         }
 
-        picked?.let { file ->
+        val file = picked
+        val engine = selectedEngine
+        if (file != null && engine != null) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -133,11 +145,15 @@ fun CorruptorScreen() {
                 }
             }
 
+            val engineValues = engineViewModel.valuesFor(engine.id)
+            // Reading .toMap() here is a tracked Compose read of the
+            // SnapshotStateMap, so editing any parameter below recomposes this
+            // screen and produces a new (structurally-comparable) key for the
+            // LaunchedEffect further down.
+            val currentValues = engineValues.toMap()
+
             if (file.isImage) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     PreviewPane("Original", file.bytes, Modifier.weight(1f))
                     PreviewPane("Corrupted", corrupted, Modifier.weight(1f), isLoading = isProcessing)
                 }
@@ -145,34 +161,23 @@ fun CorruptorScreen() {
                 HexPreview(corrupted!!)
             }
 
-            Text("Corruption mode", style = MaterialTheme.typography.titleMedium)
-            CorruptionModeSelector(selected = mode, onSelect = { mode = it })
-
-            Text(
-                "Intensity: ${(intensity * 100).toInt()}%",
-                style = MaterialTheme.typography.titleMedium
-            )
-            Slider(value = intensity, onValueChange = { intensity = it }, valueRange = 0.01f..1f)
-
-            if (mode == CorruptionMode.CHUNK_SHUFFLE || mode == CorruptionMode.CHUNK_REVERSE || mode == CorruptionMode.DUPLICATE_BLOCK) {
-                Text("Chunk size: ${chunkSize.toInt()} bytes", style = MaterialTheme.typography.titleMedium)
-                Slider(value = chunkSize, onValueChange = { chunkSize = it }, valueRange = 16f..4096f)
+            Text("Parameters", style = MaterialTheme.typography.titleMedium)
+            engine.parameters.filterNot { it.hidden }.forEach { def ->
+                ParameterControl(
+                    def = def,
+                    value = engineValues[def.id] ?: ParamValue(def.default),
+                    onValueChange = { engineValues[def.id] = it }
+                )
             }
 
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text("Preserve file header", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "Keeps the first bytes intact so the file often still opens, just glitched.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+            LaunchedEffect(file.bytes, engine.id, currentValues) {
+                isProcessing = true
+                delay(120) // debounce rapid slider drags / typing
+                val result = withContext(Dispatchers.Default) {
+                    CorruptionEngineExecutor.run(file.bytes, engine, currentValues)
                 }
-                Switch(checked = preserveHeader, onCheckedChange = { preserveHeader = it })
+                corrupted = result
+                isProcessing = false
             }
 
             Button(
@@ -198,32 +203,7 @@ fun CorruptorScreen() {
 }
 
 @Composable
-private fun CorruptionModeSelector(selected: CorruptionMode, onSelect: (CorruptionMode) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(CorruptionMode.entries.toList()) { m ->
-                FilterChip(
-                    selected = m == selected,
-                    onClick = { onSelect(m) },
-                    label = { Text(m.label) }
-                )
-            }
-        }
-        Text(
-            selected.description,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
-@Composable
-private fun PreviewPane(
-    label: String,
-    bytes: ByteArray?,
-    modifier: Modifier = Modifier,
-    isLoading: Boolean = false
-) {
+private fun PreviewPane(label: String, bytes: ByteArray?, modifier: Modifier = Modifier, isLoading: Boolean = false) {
     Column(modifier) {
         Text(label, style = MaterialTheme.typography.labelLarge)
         Spacer(Modifier.height(4.dp))
@@ -240,11 +220,11 @@ private fun PreviewPane(
             }
             when {
                 isLoading -> CircularProgressIndicator()
-                bitmap != null -> androidx.compose.foundation.Image(
+                bitmap != null -> Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = label,
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                    contentScale = ContentScale.Crop
                 )
                 else -> Icon(
                     Icons.Filled.BrokenImage,
@@ -263,10 +243,7 @@ private fun HexPreview(bytes: ByteArray) {
         Column(Modifier.padding(12.dp)) {
             Text("Hex preview (first 256 bytes)", style = MaterialTheme.typography.labelLarge)
             Spacer(Modifier.height(6.dp))
-            Text(
-                preview,
-                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
-            )
+            Text(preview, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace))
         }
     }
 }

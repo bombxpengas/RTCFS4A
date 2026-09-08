@@ -1,0 +1,45 @@
+{
+  "id": "classic_byte_shift",
+  "name": "Byte Shift",
+  "description": "Adds a fixed offset to random byte values — color-shift / smear look on images.",
+  "author": "File Corruptor",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "intensity",
+      "label": "Intensity",
+      "type": "slider",
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "default": "20",
+      "unit": "%",
+      "description": "Percentage of bytes (outside the preserved header) that get shifted."
+    },
+    {
+      "id": "shiftAmount",
+      "label": "Shift Amount",
+      "type": "slider",
+      "min": 1,
+      "max": 255,
+      "step": 1,
+      "default": "32"
+    },
+    {
+      "id": "skipBytes",
+      "label": "Preserve Header (bytes)",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "128",
+      "unit": "bytes"
+    }
+  ],
+  "operations": [
+    {
+      "type": "byte_shift",
+      "params": { "intensity": "intensity", "skipBytes": "skipBytes", "shiftAmount": "shiftAmount" }
+    }
+  ]
+}

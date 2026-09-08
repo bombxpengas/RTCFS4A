@@ -1,0 +1,46 @@
+{
+  "id": "classic_chunk_shuffle",
+  "name": "Chunk Shuffle",
+  "description": "Swaps fixed-size chunks of the file around — big blocky glitches, datamosh-like.",
+  "author": "File Corruptor",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "intensity",
+      "label": "Intensity",
+      "type": "slider",
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "default": "20",
+      "unit": "%",
+      "description": "Percentage of chunks that get swapped with another random chunk."
+    },
+    {
+      "id": "chunkSize",
+      "label": "Chunk Size",
+      "type": "number",
+      "min": 16,
+      "max": 65536,
+      "step": 16,
+      "default": "256",
+      "unit": "bytes"
+    },
+    {
+      "id": "skipBytes",
+      "label": "Preserve Header (bytes)",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "128",
+      "unit": "bytes"
+    }
+  ],
+  "operations": [
+    {
+      "type": "chunk_shuffle",
+      "params": { "intensity": "intensity", "skipBytes": "skipBytes", "chunkSize": "chunkSize" }
+    }
+  ]
+}

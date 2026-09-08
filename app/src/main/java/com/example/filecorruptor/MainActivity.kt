@@ -7,27 +7,29 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
-import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.ui.CorruptorScreen
-import com.example.filecorruptor.ui.StubScreen
+import com.example.filecorruptor.ui.SettingsScreen
 import com.example.filecorruptor.ui.theme.FileCorruptorTheme
 
 private sealed class Destination(val route: String, val label: String) {
     data object Corruptor : Destination("corruptor", "Corruptor")
-    data object Stub : Destination("stub", "File Stub")
+    data object Settings : Destination("settings", "Settings")
 }
 
-private val destinations = listOf(Destination.Corruptor, Destination.Stub)
+private val destinations = listOf(Destination.Corruptor, Destination.Settings)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,6 +46,15 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AppRoot() {
     val navController = rememberNavController()
+
+    // Resolved here (composed directly under the Activity, not inside a
+    // NavHost destination) so it's Activity-scoped and shared by both tabs.
+    // If each screen instead called viewModel() with no argument itself,
+    // Navigation-Compose would scope each call to that destination's own
+    // NavBackStackEntry, handing Corruptor and Settings two *separate*
+    // instances — silently breaking the "selection and parameter values
+    // persist across tabs" behavior this app depends on.
+    val engineViewModel: EngineViewModel = viewModel()
 
     Scaffold(
         bottomBar = {
@@ -66,7 +77,7 @@ private fun AppRoot() {
                         },
                         icon = {
                             Icon(
-                                if (dest is Destination.Corruptor) Icons.Filled.BrokenImage else Icons.Filled.Description,
+                                if (dest is Destination.Corruptor) Icons.Filled.BrokenImage else Icons.Filled.Settings,
                                 contentDescription = dest.label
                             )
                         },
@@ -81,8 +92,8 @@ private fun AppRoot() {
             startDestination = Destination.Corruptor.route,
             modifier = Modifier.padding(innerPadding)
         ) {
-            composable(Destination.Corruptor.route) { CorruptorScreen() }
-            composable(Destination.Stub.route) { StubScreen() }
+            composable(Destination.Corruptor.route) { CorruptorScreen(engineViewModel) }
+            composable(Destination.Settings.route) { SettingsScreen(engineViewModel) }
         }
     }
 }

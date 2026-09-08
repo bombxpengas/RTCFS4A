@@ -1,0 +1,78 @@
+{
+  "id": "vinesauce_rom_corruptor",
+  "name": "Vinesauce ROM Corruptor",
+  "description": "Classic ROM-corruptor algorithm: repeatedly overwrites randomly placed, randomly sized runs of bytes until roughly the chosen intensity of the file has been touched, while preserving a header region so the ROM often still boots. NOTE: this is a best-effort recreation of the well-known public Vinesauce corruptor algorithm (intensity % + min/max block size + header preservation + optional seed) — not a byte-for-byte port of a specific fork's source, since that source wasn't accessible while building this. Adjust parameters/defaults freely, or re-import an updated version of this file if your fork's exact behavior differs.",
+  "author": "Vinesauce community (recreated)",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "intensity",
+      "label": "Corruption Intensity",
+      "type": "slider",
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "default": "10",
+      "unit": "%",
+      "description": "Roughly what percentage of the ROM (outside the header) ends up touched."
+    },
+    {
+      "id": "skipBytes",
+      "label": "Header Size",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "16",
+      "unit": "bytes",
+      "description": "Bytes to leave untouched at the start of the file — e.g. 16 for an iNES-header NES ROM, 512 for some SNES copier headers, 0 for a headerless ROM."
+    },
+    {
+      "id": "blockMin",
+      "label": "Min Block Size",
+      "type": "number",
+      "min": 1,
+      "max": 100000,
+      "step": 1,
+      "default": "1",
+      "unit": "bytes"
+    },
+    {
+      "id": "blockMax",
+      "label": "Max Block Size",
+      "type": "number",
+      "min": 1,
+      "max": 100000,
+      "step": 1,
+      "default": "8",
+      "unit": "bytes"
+    },
+    {
+      "id": "useSeed",
+      "label": "Use Fixed Seed",
+      "type": "switch",
+      "default": "false",
+      "description": "Reuse the same seed to reproduce identical corruption on identical input."
+    },
+    {
+      "id": "seed",
+      "label": "Seed",
+      "type": "number",
+      "min": 0,
+      "max": 999999999,
+      "step": 1,
+      "default": "1"
+    }
+  ],
+  "operations": [
+    {
+      "type": "random_block_overwrite",
+      "params": {
+        "intensity": "intensity",
+        "skipBytes": "skipBytes",
+        "blockMin": "blockMin",
+        "blockMax": "blockMax"
+      }
+    }
+  ]
+}

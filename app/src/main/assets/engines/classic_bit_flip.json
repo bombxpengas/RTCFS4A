@@ -1,0 +1,37 @@
+{
+  "id": "classic_bit_flip",
+  "name": "Bit Flip",
+  "description": "Flips random individual bits — subtler than full byte replacement, often preserves more file structure.",
+  "author": "File Corruptor",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "intensity",
+      "label": "Intensity",
+      "type": "slider",
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "default": "10",
+      "unit": "%",
+      "description": "Percentage of available bits (outside the preserved header) that get flipped."
+    },
+    {
+      "id": "skipBytes",
+      "label": "Preserve Header (bytes)",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "128",
+      "unit": "bytes",
+      "description": "Bytes at the start of the file left untouched."
+    }
+  ],
+  "operations": [
+    {
+      "type": "bit_flip",
+      "params": { "intensity": "intensity", "skipBytes": "skipBytes" }
+    }
+  ]
+}

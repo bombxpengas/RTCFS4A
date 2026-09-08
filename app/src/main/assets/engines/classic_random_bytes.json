@@ -1,0 +1,37 @@
+{
+  "id": "classic_random_bytes",
+  "name": "Random Bytes",
+  "description": "Overwrites randomly scattered single bytes with random values — classic static/noise glitch.",
+  "author": "File Corruptor",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "intensity",
+      "label": "Intensity",
+      "type": "slider",
+      "min": 1,
+      "max": 100,
+      "step": 1,
+      "default": "15",
+      "unit": "%",
+      "description": "Percentage of the file's bytes (outside the preserved header) that get overwritten."
+    },
+    {
+      "id": "skipBytes",
+      "label": "Preserve Header (bytes)",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "128",
+      "unit": "bytes",
+      "description": "Bytes at the start of the file left untouched, so it often still partially opens."
+    }
+  ],
+  "operations": [
+    {
+      "type": "random_bytes",
+      "params": { "intensity": "intensity", "skipBytes": "skipBytes" }
+    }
+  ]
+}
