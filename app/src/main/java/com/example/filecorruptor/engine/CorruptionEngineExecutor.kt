@@ -14,16 +14,33 @@ import kotlin.random.Random
  */
 object CorruptionEngineExecutor {
 
-    fun run(input: ByteArray, engine: EngineDefinition, values: Map<String, ParamValue>): ByteArray {
-        if (input.isEmpty() || engine.operations.isEmpty()) return input
+    /** [seedUsed] is whatever seed the run actually used — the manually-set
+     *  one if "Use Fixed Seed" was on, otherwise the freshly-generated one —
+     *  so callers (like Save) can record it back for config export. */
+    data class EngineRunResult(val bytes: ByteArray, val seedUsed: Long)
+
+    fun run(input: ByteArray, engine: EngineDefinition, values: Map<String, ParamValue>): ByteArray =
+        runWithSeed(input, engine, values).bytes
+
+    fun runWithSeed(input: ByteArray, engine: EngineDefinition, values: Map<String, ParamValue>): EngineRunResult {
+        if (input.isEmpty() || engine.operations.isEmpty()) return EngineRunResult(input, 0L)
         val output = input.copyOf()
 
         // Two special, opt-in parameter ids: an engine that declares a "seed"
         // (number) and "useSeed" (switch) parameter gets reproducible output;
         // engines that don't declare them just get fresh randomness each run.
+        // The fallback seed is kept within the same 0..999999999 range the
+        // "seed" number field itself uses, so writing it back to that field
+        // (see Save in CorruptorScreen) never gets silently clamped or loses
+        // precision converting through the UI's Double-based number field.
         val useSeed = values["useSeed"]?.asBoolean() == true
         val seedValue = values["seed"]
-        val random = if (useSeed && seedValue != null) Random(seedValue.asLong()) else Random(System.nanoTime())
+        val actualSeed = if (useSeed && seedValue != null) {
+            seedValue.asLong()
+        } else {
+            (System.nanoTime() % 1_000_000_000L).let { if (it < 0) it + 1_000_000_000L else it }
+        }
+        val random = Random(actualSeed)
 
         for (op in engine.operations) {
             if (op.enabledParam != null && values[op.enabledParam]?.asBoolean() != true) {
@@ -31,7 +48,7 @@ object CorruptionEngineExecutor {
             }
             applyOperation(output, op, values, random)
         }
-        return output
+        return EngineRunResult(output, actualSeed)
     }
 
     private fun resolveDouble(op: OperationDef, argName: String, values: Map<String, ParamValue>, default: Double): Double {
@@ -107,6 +124,14 @@ object CorruptionEngineExecutor {
                 bigEndian = resolveBool(op, "bigEndian", values, false),
                 useValueList = resolveBool(op, "useValueList", values, false),
                 valueListText = resolveString(op, "valueList", values, ""),
+                min8 = resolveULong(op, "min8", values, 0UL),
+                max8 = resolveULong(op, "max8", values, 0xFFUL),
+                min16 = resolveULong(op, "min16", values, 0UL),
+                max16 = resolveULong(op, "max16", values, 0xFFFFUL),
+                min32 = resolveULong(op, "min32", values, 0UL),
+                max32 = resolveULong(op, "max32", values, 0xFFFFFFFFUL),
+                min64 = resolveULong(op, "min64", values, 0UL),
+                max64 = resolveULong(op, "max64", values, ULong.MAX_VALUE),
                 r = random
             )
             "nightmare_engine" -> nightmareEngine(
@@ -127,6 +152,20 @@ object CorruptionEngineExecutor {
                 max32 = resolveULong(op, "max32", values, 0xFFFFFFFFUL),
                 min64 = resolveULong(op, "min64", values, 0UL),
                 max64 = resolveULong(op, "max64", values, ULong.MAX_VALUE),
+                r = random
+            )
+            "cluster_engine" -> clusterEngine(
+                buf,
+                shuffleType = resolveString(op, "shuffleType", values, "Random"),
+                direction = resolveString(op, "direction", values, "Forwards"),
+                chunkSize = resolveInt(op, "chunkSize", values, 3),
+                modifier = resolveInt(op, "modifier", values, 1),
+                precision = resolveInt(op, "precision", values, 4),
+                alignment = resolveInt(op, "alignment", values, 0),
+                iterations = resolveInt(op, "iterations", values, 100),
+                rangeStart = resolveInt(op, "rangeStart", values, -1),
+                rangeEnd = resolveInt(op, "rangeEnd", values, -1),
+                headerSize = resolveInt(op, "headerSize", values, 0),
                 r = random
             )
             else -> {
@@ -367,14 +406,24 @@ object CorruptionEngineExecutor {
      *  - ValueList (a curated per-game pool of "safe" constants, matched
      *    against the original bytes via GetRandomConstant) becomes an
      *    optional user-supplied hex list ([valueListText]); with it off, a
-     *    uniformly random 32-bit value is used instead, since we don't have
-     *    RTCV's shipped value-list database to draw from.
+     *    uniformly random value within the chosen bit-width's Min/Max bounds
+     *    is used instead (same bit-width + bounds UI as the Nightmare Engine),
+     *    since we don't have RTCV's shipped value-list database to draw from.
      *  - UnlockPrecision/CachedPrecision (BizHawk-reported bus width) becomes
-     *    a plain [precision] number the person sets directly — functionally
-     *    the same as always running "unlocked" with an explicit value.
+     *    a plain [precision] choice (1/2/4/8 bytes) the person sets directly —
+     *    functionally the same as always running "unlocked" with an explicit
+     *    value, just with real min/max control over what gets written now.
      * The original runs GenerateUnit once per engine tick for as long as
      * corruption is engaged live; [iterations] is how many of those ticks'
      * worth of writes to bake into this one-shot file transform.
+     *
+     * Note this only changes how the *value* to write is produced — the
+     * address math below (safeAddress + its out-of-range clamp) is
+     * untouched from the original port and still uses [alignment] the same
+     * way the real RTC_VectorEngine.GenerateUnit does, which is genuinely
+     * different from the Nightmare Engine's own clamp (that one uses
+     * precision). Kept exactly as before so this stays a functionally
+     * faithful port, not a merge of two different engines' math.
      */
     private fun vectorEngine(
         buf: ByteArray,
@@ -387,16 +436,20 @@ object CorruptionEngineExecutor {
         bigEndian: Boolean,
         useValueList: Boolean,
         valueListText: String,
+        min8: ULong, max8: ULong,
+        min16: ULong, max16: ULong,
+        min32: ULong, max32: ULong,
+        min64: ULong, max64: ULong,
         r: Random
     ) {
-        if (buf.size < 4 || iterations <= 0) return
-        val precisionSafe = precision.coerceAtLeast(1)
+        if (buf.isEmpty() || iterations <= 0) return
+        val prec = if (precision in intArrayOf(1, 2, 4, 8)) precision else 4
         val align = alignment.coerceAtLeast(0)
         val header = headerSize.coerceIn(0, buf.size)
 
         val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
         val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
-        if (end - start < 4) return
+        if (end - start < prec) return
 
         val pool = if (useValueList) parseHexValueList(valueListText) else null
 
@@ -406,7 +459,7 @@ object CorruptionEngineExecutor {
             val address = start + r.nextInt(end - start)
 
             // --- exact port of RTC_VectorEngine.GenerateUnit begins ---
-            var safeAddress = address - (address % precisionSafe) + align // 32-bit trunc
+            var safeAddress = address - (address % prec) + align
             if (safeAddress > end - align) {
                 safeAddress = end - (2 * align) + align // out of range: hit the last aligned address
             }
@@ -414,35 +467,27 @@ object CorruptionEngineExecutor {
 
             // Safety net the original doesn't need (its MemoryInterface
             // handles bounds itself): never write outside our own range/buffer.
-            if (safeAddress < start || safeAddress < 0 || safeAddress + 4 > end || safeAddress + 4 > buf.size) {
+            if (safeAddress < start || safeAddress < 0 || safeAddress + prec > end || safeAddress + prec > buf.size) {
                 return@repeat
             }
 
-            val value = pool?.takeIf { it.isNotEmpty() }?.let { it[r.nextInt(it.size)] } ?: r.nextInt()
-            writeInt32(buf, safeAddress, value, bigEndian)
+            val value: ULong = pool?.takeIf { it.isNotEmpty() }?.let { it[r.nextInt(it.size)] }
+                ?: when (prec) {
+                    1 -> randomULongInRange(r, min8, max8)
+                    2 -> randomULongInRange(r, min16, max16)
+                    8 -> randomULongInRange(r, min64, max64)
+                    else -> randomULongInRange(r, min32, max32) // 4 (and any unexpected fallback)
+                }
+            writeUnsignedBytes(buf, safeAddress, prec, value, bigEndian)
         }
     }
 
-    /** Parses a comma/space/newline separated list of hex 32-bit constants, e.g. "DEADBEEF, 0x1234ABCD". */
-    private fun parseHexValueList(text: String): List<Int> =
+    /** Parses a comma/space/newline separated list of hex constants, e.g. "DEADBEEF, 0x1234ABCD". */
+    private fun parseHexValueList(text: String): List<ULong> =
         text.split(',', ' ', '\n', '\t', '\r')
             .map { it.trim().removePrefix("0x").removePrefix("0X") }
             .filter { it.isNotEmpty() }
-            .mapNotNull { it.toLongOrNull(16)?.toInt() }
-
-    private fun writeInt32(buf: ByteArray, offset: Int, value: Int, bigEndian: Boolean) {
-        if (bigEndian) {
-            buf[offset] = ((value ushr 24) and 0xFF).toByte()
-            buf[offset + 1] = ((value ushr 16) and 0xFF).toByte()
-            buf[offset + 2] = ((value ushr 8) and 0xFF).toByte()
-            buf[offset + 3] = (value and 0xFF).toByte()
-        } else {
-            buf[offset] = (value and 0xFF).toByte()
-            buf[offset + 1] = ((value ushr 8) and 0xFF).toByte()
-            buf[offset + 2] = ((value ushr 16) and 0xFF).toByte()
-            buf[offset + 3] = ((value ushr 24) and 0xFF).toByte()
-        }
-    }
+            .mapNotNull { it.toULongOrNull(16) }
 
     /**
      * Ported from RTCV's real RTC_NightmareEngine.GenerateUnit. Each blast
@@ -565,5 +610,113 @@ object CorruptionEngineExecutor {
         // that correctly down to the size's own bit width.
         val updated = (current + delta.toLong().toULong()) and mask
         writeUnsignedBytes(buf, offset, size, updated, bigEndian)
+    }
+
+    /**
+     * Ported from RTCV's real RTC_ClusterEngine.GenerateUnit: reads a run of
+     * [chunkSize] consecutive [precision]-byte segments starting at a
+     * computed aligned address, reorders those segments (Random shuffle,
+     * Reverse, Rotate Forwards, Rotate Backwards, or Overwrite-with-one-
+     * segment), and writes them back to the same span. Unlike Vector/
+     * Nightmare, this never invents a new byte value — it only rearranges
+     * bytes already in the file.
+     *
+     * Adapted for a static file: LimiterListHash/FilterAll (RTCV's curated
+     * per-game address permission checks, which is also where the real
+     * engine actually reads its Precision from) become the plain
+     * [rangeStart]/[rangeEnd]/[headerSize] range this app already uses
+     * elsewhere, with [precision] exposed directly as a value you set.
+     * OutputMultipleUnits is a pure implementation detail of RTCV's live
+     * BlastUnit system (one write vs. several) with no effect on the
+     * resulting bytes, so it's dropped — the file ends up identical either way.
+     */
+    private fun clusterEngine(
+        buf: ByteArray,
+        shuffleType: String,
+        direction: String,
+        chunkSize: Int,
+        modifier: Int,
+        precision: Int,
+        alignment: Int,
+        iterations: Int,
+        rangeStart: Int,
+        rangeEnd: Int,
+        headerSize: Int,
+        r: Random
+    ) {
+        if (buf.isEmpty() || iterations <= 0) return
+        val prec = precision.coerceAtLeast(1)
+        val chunks = chunkSize.coerceAtLeast(2) // shuffling a single segment is a no-op
+        val align = alignment.coerceAtLeast(0)
+        val header = headerSize.coerceIn(0, buf.size)
+
+        val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
+        val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
+        val spanBytes = chunks * prec
+        if (end - start < spanBytes) return
+
+        val backwards = direction.trim().equals("Backwards", ignoreCase = true)
+
+        repeat(iterations) {
+            val address = start + r.nextInt(end - start)
+
+            // --- exact port of RTC_ClusterEngine.GenerateUnit's address math ---
+            var safeAddress = address - (address % prec) + align
+            if (safeAddress > end - prec) {
+                safeAddress = end - (prec * 2) + align // out of range: hit the last aligned address
+            }
+            if (safeAddress + spanBytes >= end) return@repeat // ported "chunk doesn't fit: abort"
+            // --- end port ---
+
+            if (safeAddress < start || safeAddress < 0 || safeAddress + spanBytes > buf.size) return@repeat
+
+            // Read the chunk's segments out.
+            val segments = ArrayList<ByteArray>(chunks)
+            for (j in 0 until chunks) {
+                val segStart = safeAddress + j * prec
+                segments.add(buf.copyOfRange(segStart, segStart + prec))
+            }
+
+            val srcUnit = if (backwards) chunks - 1 else 0
+
+            // --- exact port of the ShuffleType switch ---
+            when (shuffleType.trim().lowercase()) {
+                "reverse" -> segments.reverse()
+                "rotate forwards" -> repeat(modifier.coerceAtLeast(0)) { rotateForward(segments) }
+                "rotate backwards" -> repeat(modifier.coerceAtLeast(0)) { rotateBackward(segments) }
+                "overwrite" -> {
+                    val src = segments[srcUnit]
+                    for (j in segments.indices) segments[j] = src
+                }
+                else -> shuffleRandom(segments, r) // "random" (default)
+            }
+            // --- end port ---
+
+            for (j in 0 until chunks) {
+                segments[j].copyInto(buf, safeAddress + j * prec)
+            }
+        }
+    }
+
+    /** Exact port of RTC_ClusterEngine's Fisher-Yates: RtcCore.RND.Next(n+1) each step. */
+    private fun shuffleRandom(list: MutableList<ByteArray>, r: Random) {
+        var n = list.size
+        while (n > 1) {
+            n--
+            val k = r.nextInt(n + 1)
+            val tmp = list[k]
+            list[k] = list[n]
+            list[n] = tmp
+        }
+    }
+
+    private fun rotateForward(list: MutableList<ByteArray>) {
+        val x = list.removeAt(list.size - 1)
+        list.add(0, x)
+    }
+
+    private fun rotateBackward(list: MutableList<ByteArray>) {
+        val x = list.removeAt(0)
+        list.add(x)
     }
 }

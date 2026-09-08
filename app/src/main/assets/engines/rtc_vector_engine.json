@@ -1,10 +1,60 @@
 {
   "id": "rtc_vector_engine",
   "name": "RTC Vector Engine",
-  "description": "Ported from RTCV's real RTC_VectorEngine.GenerateUnit: repeatedly picks a random address, aligns it to Precision + Alignment (safeAddress = address - address % precision + alignment), clamps it back in range if it overshoots, and writes a random (or list-picked) 32-bit constant there. The address math is copied directly from RTCV's source; the curated per-game Limiter/Value lists RTCV normally draws from are approximated here with a plain byte range and an optional user-supplied value list, since that curated database isn't something a standalone file tool has access to.",
+  "description": "Ported from RTCV's real RTC_VectorEngine.GenerateUnit: repeatedly picks a random address, aligns it to Precision + Alignment (safeAddress = address - address % precision + alignment), clamps it back in range if it overshoots, and writes a random (or list-picked) constant there. The address math is copied directly from RTCV's source; the curated per-game Limiter/Value lists RTCV normally draws from are approximated here with a plain byte range and an optional user-supplied value list.",
   "author": "Ported from RTCV (RTC_VectorEngine.cs) for RTCFS4A",
-  "version": "1.0",
+  "version": "1.1",
   "parameters": [
+    {
+      "id": "precision",
+      "label": "Precision (bytes)",
+      "type": "dropdown",
+      "options": ["1", "2", "4", "8"],
+      "default": "4",
+      "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit. RTCV defaults to 4 (32-bit) unless a game's memory domain reports a wider bus, which is what \"Unlock Precision\" exposed — pick it directly here instead."
+    },
+    {
+      "id": "min8", "label": "Min Value (8-bit)", "type": "number",
+      "min": 0, "max": 255, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+    },
+    {
+      "id": "max8", "label": "Max Value (8-bit)", "type": "number",
+      "min": 0, "max": 255, "step": 1, "default": "255",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+    },
+    {
+      "id": "min16", "label": "Min Value (16-bit)", "type": "number",
+      "min": 0, "max": 65535, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+    },
+    {
+      "id": "max16", "label": "Max Value (16-bit)", "type": "number",
+      "min": 0, "max": 65535, "step": 1, "default": "65535",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+    },
+    {
+      "id": "min32", "label": "Min Value (32-bit)", "type": "number",
+      "min": 0, "max": 4294967295, "step": 1, "default": "0",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+    },
+    {
+      "id": "max32", "label": "Max Value (32-bit)", "type": "number",
+      "min": 0, "max": 4294967295, "step": 1, "default": "4294967295",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+    },
+    {
+      "id": "min64", "label": "Min Value (64-bit)", "type": "number",
+      "min": 0, "max": 18446744073709551615, "step": 1, "default": "0",
+      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand — the default full range is exact until you touch it.",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+    },
+    {
+      "id": "max64", "label": "Max Value (64-bit)", "type": "number",
+      "min": 0, "max": 18446744073709551615, "step": 1, "default": "18446744073709551615",
+      "description": "Same precision caveat as Min Value (64-bit) above.",
+      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+    },
     {
       "id": "iterations",
       "label": "Blast Count",
@@ -14,24 +64,14 @@
       "step": 1,
       "default": "200",
       "unit": " blasts",
-      "description": "How many random 32-bit writes to perform. RTCV normally does one of these per engine tick for as long as corruption is live; this bakes that many ticks into one pass. Use the number box next to the slider for exact values."
-    },
-    {
-      "id": "precision",
-      "label": "Precision",
-      "type": "number",
-      "min": 1,
-      "max": 64,
-      "step": 1,
-      "default": "4",
-      "description": "Address alignment width, in bytes. RTCV defaults to 4 (32-bit) unless a game's memory domain reports a wider bus, which is what \"Unlock Precision\" exposed \u2014 set it directly here instead."
+      "description": "How many random writes to perform. RTCV normally does one of these per engine tick for as long as corruption is live; this bakes that many ticks into one pass. Use the number box next to the slider for exact values."
     },
     {
       "id": "alignment",
       "label": "Alignment",
       "type": "number",
       "min": 0,
-      "max": 63,
+      "max": 1000000,
       "step": 1,
       "default": "0",
       "description": "Sub-offset added after rounding down to Precision, exactly as in the original: safeAddress = address - (address % precision) + alignment."
@@ -72,25 +112,23 @@
       "label": "Big Endian",
       "type": "switch",
       "default": "false",
-      "description": "Byte order for the 32-bit value written at each address \u2014 matches the target memory domain's endianness, same as RTCV's per-domain BigEndian flag."
+      "description": "Byte order for the value written at each address — matches the target memory domain's endianness, same as RTCV's per-domain BigEndian flag."
     },
     {
       "id": "useValueList",
       "label": "Use Value List",
       "type": "switch",
       "default": "false",
-      "description": "RTCV normally draws each write's value from a curated, per-game Value List. Turn this on to supply your own; off picks a uniformly random 32-bit value each time instead."
+      "description": "RTCV normally draws each write's value from a curated, per-game Value List. Turn this on to supply your own; off picks a uniformly random value within the Min/Max bounds above instead."
     },
     {
       "id": "valueList",
       "label": "Value List (hex, comma-separated)",
       "type": "text",
       "default": "",
-      "description": "e.g. DEADBEEF, 0x00000000, FFFFFFFF \u2014 each blast picks one of these at random instead of a fully random value.",
+      "description": "e.g. DEADBEEF, 0x00000000, FFFFFFFF — each blast picks one of these at random instead of a bounded random value. Overrides Min/Max above when on.",
       "visibleWhenParam": "useValueList",
-      "visibleWhenValues": [
-        "true"
-      ]
+      "visibleWhenValues": ["true"]
     },
     {
       "id": "useSeed",
@@ -108,24 +146,26 @@
       "step": 1,
       "default": "1",
       "visibleWhenParam": "useSeed",
-      "visibleWhenValues": [
-        "true"
-      ]
+      "visibleWhenValues": ["true"]
     }
   ],
   "operations": [
     {
       "type": "vector_engine",
       "params": {
-        "iterations": "iterations",
         "precision": "precision",
         "alignment": "alignment",
+        "iterations": "iterations",
         "rangeStart": "rangeStart",
         "rangeEnd": "rangeEnd",
         "headerSize": "headerSize",
         "bigEndian": "bigEndian",
         "useValueList": "useValueList",
-        "valueList": "valueList"
+        "valueList": "valueList",
+        "min8": "min8", "max8": "max8",
+        "min16": "min16", "max16": "max16",
+        "min32": "min32", "max32": "max32",
+        "min64": "min64", "max64": "max64"
       }
     }
   ]

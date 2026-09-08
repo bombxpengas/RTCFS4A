@@ -1,0 +1,140 @@
+{
+  "id": "rtc_cluster_engine",
+  "name": "RTC Cluster Engine",
+  "description": "Ported from RTCV's real RTC_ClusterEngine.GenerateUnit: reads a run of Chunk Size consecutive Precision-byte segments starting at a computed aligned address, then reorders those segments — Random shuffle, Reverse, Rotate Forwards/Backwards, or Overwrite them all with one — and writes them back to the same span. Unlike the Vector/Nightmare engines, this never invents a new byte value, it only rearranges bytes that were already there.",
+  "author": "Ported from RTCV (RTC_ClusterEngine.cs) for RTCFS4A",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "shuffleType",
+      "label": "Shuffle Type",
+      "type": "dropdown",
+      "options": ["Random", "Reverse", "Rotate Forwards", "Rotate Backwards", "Overwrite"],
+      "default": "Random",
+      "description": "Random: Fisher-Yates shuffle of the chunk's segments. Reverse: flips their order. Rotate Forwards/Backwards: rotates by Modifier steps. Overwrite: replaces every segment with one end segment (which end depends on Direction)."
+    },
+    {
+      "id": "direction",
+      "label": "Direction",
+      "type": "dropdown",
+      "options": ["Forwards", "Backwards"],
+      "default": "Forwards",
+      "description": "Only matters for Overwrite mode: Forwards uses the first segment in the chunk as the source; Backwards uses the last."
+    },
+    {
+      "id": "chunkSize",
+      "label": "Chunk Size (segments)",
+      "type": "slider",
+      "min": 2,
+      "max": 256,
+      "step": 1,
+      "default": "3",
+      "description": "How many Precision-byte segments make up each shuffled chunk. Use the number box next to the slider for exact values."
+    },
+    {
+      "id": "modifier",
+      "label": "Modifier",
+      "type": "number",
+      "min": 0,
+      "max": 10000,
+      "step": 1,
+      "default": "1",
+      "description": "Number of rotation steps for Rotate Forwards/Backwards. Unused by the other shuffle types."
+    },
+    {
+      "id": "precision",
+      "label": "Segment Size (bytes)",
+      "type": "dropdown",
+      "options": ["1", "2", "4", "8"],
+      "default": "4",
+      "description": "Size of each segment being shuffled. RTCV normally reads this from a curated per-game Limiter List; pick it directly here instead."
+    },
+    {
+      "id": "iterations",
+      "label": "Blast Count",
+      "type": "slider",
+      "min": 1,
+      "max": 1000000,
+      "step": 1,
+      "default": "100",
+      "unit": " blasts",
+      "description": "How many random chunk-shuffles to perform. Use the number box next to the slider for exact values."
+    },
+    {
+      "id": "alignment",
+      "label": "Alignment",
+      "type": "number",
+      "min": 0,
+      "max": 1000000,
+      "step": 1,
+      "default": "0",
+      "description": "Sub-offset added after rounding down to Segment Size, exactly as in the original: safeAddress = address - (address % precision) + alignment."
+    },
+    {
+      "id": "rangeStart",
+      "label": "Start Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (right after Header Size below). Stands in for RTCV's per-game Limiter List, which restricts which addresses are eligible."
+    },
+    {
+      "id": "rangeEnd",
+      "label": "End Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (end of file)."
+    },
+    {
+      "id": "headerSize",
+      "label": "Header Size",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "16",
+      "unit": "bytes",
+      "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds, 512 for headered .smc, 0 for a headerless ROM."
+    },
+    {
+      "id": "useSeed",
+      "label": "Use Fixed Seed",
+      "type": "switch",
+      "default": "false",
+      "description": "Reuse the same seed to reproduce identical corruption on identical input."
+    },
+    {
+      "id": "seed",
+      "label": "Seed",
+      "type": "number",
+      "min": 0,
+      "max": 999999999,
+      "step": 1,
+      "default": "1",
+      "visibleWhenParam": "useSeed",
+      "visibleWhenValues": ["true"]
+    }
+  ],
+  "operations": [
+    {
+      "type": "cluster_engine",
+      "params": {
+        "shuffleType": "shuffleType",
+        "direction": "direction",
+        "chunkSize": "chunkSize",
+        "modifier": "modifier",
+        "precision": "precision",
+        "alignment": "alignment",
+        "iterations": "iterations",
+        "rangeStart": "rangeStart",
+        "rangeEnd": "rangeEnd",
+        "headerSize": "headerSize"
+      }
+    }
+  ]
+}
