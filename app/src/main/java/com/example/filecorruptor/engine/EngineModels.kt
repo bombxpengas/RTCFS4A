@@ -22,17 +22,23 @@ data class ParameterDef(
     val hidden: Boolean = false
 )
 
-enum class ParamType { SLIDER, SWITCH, NUMBER, DROPDOWN }
+enum class ParamType { SLIDER, SWITCH, NUMBER, DROPDOWN, TEXT }
 
 /**
  * One corruption pass. [type] selects a built-in primitive (see
  * CorruptionEngineExecutor), and [params] binds that primitive's named
  * arguments (e.g. "intensity", "skipBytes", "chunkSize") to parameter ids
  * declared in the engine's own [ParameterDef] list.
+ *
+ * [enabledParam], if set, must name a SWITCH parameter; the whole operation
+ * is skipped when that switch is off. This is what lets an engine expose
+ * "Enable byte corruption" / "Enable text find/replace" as independent
+ * on/off passes rather than always running every operation.
  */
 data class OperationDef(
     val type: String,
-    val params: Map<String, String> = emptyMap()
+    val params: Map<String, String> = emptyMap(),
+    val enabledParam: String? = null
 )
 
 data class EngineDefinition(

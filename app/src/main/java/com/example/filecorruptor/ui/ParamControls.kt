@@ -32,6 +32,7 @@ fun ParameterControl(
         ParamType.NUMBER -> NumberField(def, value, onValueChange, modifier)
         ParamType.SWITCH -> SwitchRow(def, value, onValueChange, modifier)
         ParamType.DROPDOWN -> DropdownField(def, value, onValueChange, modifier)
+        ParamType.TEXT -> FreeTextField(def, value, onValueChange, modifier)
     }
 }
 
@@ -169,6 +170,25 @@ private fun DropdownField(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FreeTextField(
+    def: ParameterDef,
+    value: ParamValue,
+    onValueChange: (ParamValue) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier) {
+        ParamLabel(def)
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = value.asString(),
+            onValueChange = { onValueChange(ParamValue.of(it)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 

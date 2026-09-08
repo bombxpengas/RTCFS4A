@@ -1,23 +1,78 @@
 {
   "id": "vinesauce_rom_corruptor",
   "name": "Vinesauce ROM Corruptor",
-  "description": "Classic ROM-corruptor algorithm: repeatedly overwrites randomly placed, randomly sized runs of bytes until roughly the chosen intensity of the file has been touched, while preserving a header region so the ROM often still boots. NOTE: this is a best-effort recreation of the well-known public Vinesauce corruptor algorithm (intensity % + min/max block size + header preservation + optional seed) — not a byte-for-byte port of a specific fork's source, since that source wasn't accessible while building this. Adjust parameters/defaults freely, or re-import an updated version of this file if your fork's exact behavior differs.",
-  "author": "Vinesauce community (recreated)",
+  "description": "The exact deterministic engine from the standalone ROM Corruptor app: Add/Shift/Replace a byte value, walking the file at a configurable stride (Increment) and only actually corrupting every Nth visited byte (Frequency) — two separate knobs, not aliases of each other. Start/End of -1 means auto (just past the header / end of file). Includes NES CPU-jam protection and an independent literal text find/replace pass, each with its own on/off switch.",
+  "author": "Recreated for RTCFS4A",
   "version": "1.0",
   "parameters": [
     {
-      "id": "intensity",
-      "label": "Corruption Intensity",
-      "type": "slider",
-      "min": 1,
-      "max": 100,
-      "step": 1,
-      "default": "10",
-      "unit": "%",
-      "description": "Roughly what percentage of the ROM (outside the header) ends up touched."
+      "id": "byteCorruptionEnabled",
+      "label": "Enable Byte Corruption",
+      "type": "switch",
+      "default": "true",
+      "description": "Turn off if you only want Text Find/Replace below, without also scrambling the rest of the file."
     },
     {
-      "id": "skipBytes",
+      "id": "mode",
+      "label": "Corruption Mode",
+      "type": "dropdown",
+      "options": ["Add", "Shift", "Replace"],
+      "default": "Add",
+      "description": "Add: adds Amount to each corrupted byte (wraps at 256). Shift: bit-rotates each corrupted byte right by Amount (negative = left). Replace: turns every byte equal to Replace From into Replace To."
+    },
+    {
+      "id": "amount",
+      "label": "Amount",
+      "type": "number",
+      "min": -255,
+      "max": 255,
+      "step": 1,
+      "default": "1",
+      "description": "Used by Add and Shift modes. Shift only meaningfully differs across -7..7 (it wraps every 8)."
+    },
+    {
+      "id": "increment",
+      "label": "Increment",
+      "type": "number",
+      "min": 1,
+      "max": 1000000,
+      "step": 1,
+      "default": "1",
+      "description": "Stride between visited byte positions. 1 = visit every byte in range; 4 = only every 4th position, etc. This is distinct from Frequency below."
+    },
+    {
+      "id": "frequency",
+      "label": "Corrupt Every Nth Visited Byte",
+      "type": "number",
+      "min": 1,
+      "max": 1000000,
+      "step": 1,
+      "default": "1",
+      "description": "Of the positions Increment above visits, only every Nth one actually gets corrupted. 1 = corrupt all of them."
+    },
+    {
+      "id": "rangeStart",
+      "label": "Start Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "unit": "",
+      "description": "-1 = auto (right after Header Size below). An explicit value here always overrides the header, even to deliberately corrupt it."
+    },
+    {
+      "id": "rangeEnd",
+      "label": "End Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (end of file)."
+    },
+    {
+      "id": "headerSize",
       "label": "Header Size",
       "type": "number",
       "min": 0,
@@ -25,53 +80,80 @@
       "step": 1,
       "default": "16",
       "unit": "bytes",
-      "description": "Bytes to leave untouched at the start of the file — e.g. 16 for an iNES-header NES ROM, 512 for some SNES copier headers, 0 for a headerless ROM."
+      "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds (iNES/fwNES header), 512 for headered .smc, 0 for a headerless ROM."
     },
     {
-      "id": "blockMin",
-      "label": "Min Block Size",
-      "type": "number",
-      "min": 1,
-      "max": 100000,
-      "step": 1,
-      "default": "1",
-      "unit": "bytes"
-    },
-    {
-      "id": "blockMax",
-      "label": "Max Block Size",
-      "type": "number",
-      "min": 1,
-      "max": 100000,
-      "step": 1,
-      "default": "8",
-      "unit": "bytes"
-    },
-    {
-      "id": "useSeed",
-      "label": "Use Fixed Seed",
-      "type": "switch",
-      "default": "false",
-      "description": "Reuse the same seed to reproduce identical corruption on identical input."
-    },
-    {
-      "id": "seed",
-      "label": "Seed",
+      "id": "replaceFrom",
+      "label": "Replace From",
       "type": "number",
       "min": 0,
-      "max": 999999999,
+      "max": 255,
       "step": 1,
-      "default": "1"
+      "default": "0",
+      "description": "Replace mode only. Decimal 0-255 (e.g. 234 = 0xEA)."
+    },
+    {
+      "id": "replaceTo",
+      "label": "Replace To",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "255",
+      "description": "Replace mode only. Decimal 0-255."
+    },
+    {
+      "id": "avoidNesCpuJam",
+      "label": "Avoid NES CPU-Jam Opcodes",
+      "type": "switch",
+      "default": "false",
+      "description": "Skips writing a corrupted byte if it would land on one of the 6502's KIL/JAM opcodes, which otherwise freeze the game solid instead of glitching it."
+    },
+    {
+      "id": "useTextReplace",
+      "label": "Enable Text Find/Replace",
+      "type": "switch",
+      "default": "false",
+      "description": "Independent pass: swaps one literal text string for another anywhere in the file."
+    },
+    {
+      "id": "textFind",
+      "label": "Find Text",
+      "type": "text",
+      "default": "",
+      "description": "Case-sensitive, literal text to search for (e.g. Mario)."
+    },
+    {
+      "id": "textReplace",
+      "label": "Replace With",
+      "type": "text",
+      "default": "",
+      "description": "Should be the same length as Find Text — it's padded or truncated to match so the file's size never changes (e.g. Mario -> LUIGI, both 5 letters)."
     }
   ],
   "operations": [
     {
-      "type": "random_block_overwrite",
+      "type": "byte_corrupt",
+      "enabledParam": "byteCorruptionEnabled",
       "params": {
-        "intensity": "intensity",
-        "skipBytes": "skipBytes",
-        "blockMin": "blockMin",
-        "blockMax": "blockMax"
+        "mode": "mode",
+        "amount": "amount",
+        "increment": "increment",
+        "frequency": "frequency",
+        "rangeStart": "rangeStart",
+        "rangeEnd": "rangeEnd",
+        "headerSize": "headerSize",
+        "replaceFrom": "replaceFrom",
+        "replaceTo": "replaceTo",
+        "avoidNesCpuJam": "avoidNesCpuJam"
+      }
+    },
+    {
+      "type": "text_replace_literal",
+      "enabledParam": "useTextReplace",
+      "params": {
+        "find": "textFind",
+        "replace": "textReplace"
       }
     }
   ]

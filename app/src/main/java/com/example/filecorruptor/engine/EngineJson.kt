@@ -43,7 +43,8 @@ object EngineJson {
             val bindings = o.optJSONObject("params") ?: JSONObject()
             val paramMap = mutableMapOf<String, String>()
             bindings.keys().forEach { key -> paramMap[key] = bindings.get(key).toString() }
-            ops += OperationDef(type = o.getString("type"), params = paramMap)
+            val enabledParam = o.optString("enabledParam", "").ifBlank { null }
+            ops += OperationDef(type = o.getString("type"), params = paramMap, enabledParam = enabledParam)
         }
 
         return EngineDefinition(
