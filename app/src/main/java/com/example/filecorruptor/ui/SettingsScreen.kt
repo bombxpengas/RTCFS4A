@@ -154,21 +154,27 @@ private fun EngineFormatHelp() {
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
-                "Each parameter needs: id, label, type (slider / number / switch / dropdown), " +
+                "Each parameter needs: id, label, type (slider / number / switch / dropdown / text), " +
                     "default, and for slider/number: min, max, step, unit. Dropdown adds an \"options\" " +
-                    "array of strings. Set \"hidden\": true to keep a value out of the UI.",
+                    "array of strings. Set \"hidden\": true to keep a value out of the UI, or " +
+                    "\"visibleWhenParam\"/\"visibleWhenValues\" to only show it while another parameter " +
+                    "(e.g. a mode dropdown) currently holds certain values.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
-                "Each operation needs: type (one of random_bytes, bit_flip, chunk_shuffle, chunk_reverse, " +
-                    "byte_shift, zero_out, duplicate_block, random_block_overwrite) and a \"params\" object " +
-                    "mapping that operation's argument names (intensity, skipBytes, chunkSize, shiftAmount, " +
-                    "blockMin, blockMax) to one of your parameter ids.",
+                "Each operation needs: type (random_bytes, bit_flip, chunk_shuffle, chunk_reverse, " +
+                    "byte_shift, zero_out, duplicate_block, random_block_overwrite, byte_corrupt, " +
+                    "text_replace_literal, vector_engine, nightmare_engine, hellgenie_engine, or " +
+                    "cluster_engine) and a \"params\" object mapping that operation's argument names to " +
+                    "one of your parameter ids. An optional \"enabledParam\" names a switch parameter that " +
+                    "turns the whole operation on/off.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(
-                "A parameter named \"seed\" (number) plus \"useSeed\" (switch) makes an engine's output " +
-                    "reproducible. Multiple operations run in order, each mutating the same bytes.",
+                "A parameter named \"seed\" (number, min -1) makes an engine's output reproducible: " +
+                    "-1 means random (a fresh seed every run), any value 0 or above is used as a fixed " +
+                    "seed instead — no separate on/off switch needed. Multiple operations run in order, " +
+                    "each mutating the same bytes.",
                 style = MaterialTheme.typography.bodyMedium
             )
             Text(

@@ -9,7 +9,11 @@
       "id": "algo",
       "label": "Algorithm",
       "type": "dropdown",
-      "options": ["Random", "RandomTilt", "Tilt"],
+      "options": [
+        "Random",
+        "RandomTilt",
+        "Tilt"
+      ],
       "default": "Random",
       "description": "Random: always writes a new value. RandomTilt: new value, +1, or -1, chosen randomly each blast. Tilt: +1 or -1, chosen randomly each blast."
     },
@@ -17,51 +21,120 @@
       "id": "precision",
       "label": "Precision (bytes)",
       "type": "dropdown",
-      "options": ["1", "2", "4", "8"],
+      "options": [
+        "1",
+        "2",
+        "4",
+        "8"
+      ],
       "default": "4",
       "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit."
     },
     {
-      "id": "min8", "label": "Min Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "min8",
+      "label": "Min Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "max8", "label": "Max Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "255",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "max8",
+      "label": "Max Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "255",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "min16", "label": "Min Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "min16",
+      "label": "Min Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "max16", "label": "Max Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "65535",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "max16",
+      "label": "Max Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "65535",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "min32", "label": "Min Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "min32",
+      "label": "Min Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "max32", "label": "Max Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "4294967295",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "max32",
+      "label": "Max Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "4294967295",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "min64", "label": "Min Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "0",
-      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand (the input box can't represent every one of the ~1.8x10^19 possible values exactly) — the default full range is exact until you touch it.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "id": "min64",
+      "label": "Min Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "0",
+      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand (the input box can't represent every one of the ~1.8x10^19 possible values exactly) \u2014 the default full range is exact until you touch it.",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
-      "id": "max64", "label": "Max Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "18446744073709551615",
+      "id": "max64",
+      "label": "Max Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "18446744073709551615",
       "description": "Same precision caveat as Min Value (64-bit) above.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
       "id": "iterations",
@@ -123,22 +196,14 @@
       "description": "Byte order for multi-byte writes and tilts."
     },
     {
-      "id": "useSeed",
-      "label": "Use Fixed Seed",
-      "type": "switch",
-      "default": "false",
-      "description": "Reuse the same seed to reproduce identical corruption on identical input."
-    },
-    {
       "id": "seed",
       "label": "Seed",
       "type": "number",
-      "min": 0,
+      "min": -1,
       "max": 999999999,
       "step": 1,
-      "default": "1",
-      "visibleWhenParam": "useSeed",
-      "visibleWhenValues": ["true"]
+      "default": "-1",
+      "description": "-1 = random (a fresh seed every run, still recorded into this field on Save so Export Config can reproduce it later). Any value 0 or above is used as a fixed seed instead."
     }
   ],
   "operations": [
@@ -153,10 +218,14 @@
         "rangeEnd": "rangeEnd",
         "headerSize": "headerSize",
         "bigEndian": "bigEndian",
-        "min8": "min8", "max8": "max8",
-        "min16": "min16", "max16": "max16",
-        "min32": "min32", "max32": "max32",
-        "min64": "min64", "max64": "max64"
+        "min8": "min8",
+        "max8": "max8",
+        "min16": "min16",
+        "max16": "max16",
+        "min32": "min32",
+        "max32": "max32",
+        "min64": "min64",
+        "max64": "max64"
       }
     }
   ]

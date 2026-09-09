@@ -1,7 +1,7 @@
 {
   "id": "rtc_cluster_engine",
   "name": "RTC Cluster Engine",
-  "description": "Ported from RTCV's real RTC_ClusterEngine.GenerateUnit: reads a run of Chunk Size consecutive Precision-byte segments starting at a computed aligned address, then reorders those segments — Random shuffle, Reverse, Rotate Forwards/Backwards, or Overwrite them all with one — and writes them back to the same span. Unlike the Vector/Nightmare engines, this never invents a new byte value, it only rearranges bytes that were already there.",
+  "description": "Ported from RTCV's real RTC_ClusterEngine.GenerateUnit: reads a run of Chunk Size consecutive Precision-byte segments starting at a computed aligned address, then reorders those segments \u2014 Random shuffle, Reverse, Rotate Forwards/Backwards, or Overwrite them all with one \u2014 and writes them back to the same span. Unlike the Vector/Nightmare engines, this never invents a new byte value, it only rearranges bytes that were already there.",
   "author": "Ported from RTCV (RTC_ClusterEngine.cs) for RTCFS4A",
   "version": "1.0",
   "parameters": [
@@ -9,7 +9,13 @@
       "id": "shuffleType",
       "label": "Shuffle Type",
       "type": "dropdown",
-      "options": ["Random", "Reverse", "Rotate Forwards", "Rotate Backwards", "Overwrite"],
+      "options": [
+        "Random",
+        "Reverse",
+        "Rotate Forwards",
+        "Rotate Backwards",
+        "Overwrite"
+      ],
       "default": "Random",
       "description": "Random: Fisher-Yates shuffle of the chunk's segments. Reverse: flips their order. Rotate Forwards/Backwards: rotates by Modifier steps. Overwrite: replaces every segment with one end segment (which end depends on Direction)."
     },
@@ -17,7 +23,10 @@
       "id": "direction",
       "label": "Direction",
       "type": "dropdown",
-      "options": ["Forwards", "Backwards"],
+      "options": [
+        "Forwards",
+        "Backwards"
+      ],
       "default": "Forwards",
       "description": "Only matters for Overwrite mode: Forwards uses the first segment in the chunk as the source; Backwards uses the last."
     },
@@ -45,7 +54,12 @@
       "id": "precision",
       "label": "Segment Size (bytes)",
       "type": "dropdown",
-      "options": ["1", "2", "4", "8"],
+      "options": [
+        "1",
+        "2",
+        "4",
+        "8"
+      ],
       "default": "4",
       "description": "Size of each segment being shuffled. RTCV normally reads this from a curated per-game Limiter List; pick it directly here instead."
     },
@@ -102,22 +116,14 @@
       "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds, 512 for headered .smc, 0 for a headerless ROM."
     },
     {
-      "id": "useSeed",
-      "label": "Use Fixed Seed",
-      "type": "switch",
-      "default": "false",
-      "description": "Reuse the same seed to reproduce identical corruption on identical input."
-    },
-    {
       "id": "seed",
       "label": "Seed",
       "type": "number",
-      "min": 0,
+      "min": -1,
       "max": 999999999,
       "step": 1,
-      "default": "1",
-      "visibleWhenParam": "useSeed",
-      "visibleWhenValues": ["true"]
+      "default": "-1",
+      "description": "-1 = random (a fresh seed every run, still recorded into this field on Save so Export Config can reproduce it later). Any value 0 or above is used as a fixed seed instead."
     }
   ],
   "operations": [

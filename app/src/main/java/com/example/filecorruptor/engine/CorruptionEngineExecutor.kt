@@ -26,17 +26,15 @@ object CorruptionEngineExecutor {
         if (input.isEmpty() || engine.operations.isEmpty()) return EngineRunResult(input, 0L)
         val output = input.copyOf()
 
-        // Two special, opt-in parameter ids: an engine that declares a "seed"
-        // (number) and "useSeed" (switch) parameter gets reproducible output;
-        // engines that don't declare them just get fresh randomness each run.
-        // The fallback seed is kept within the same 0..999999999 range the
+        // A single "seed" parameter now drives this: -1 (or missing) means
+        // auto/random, anything >= 0 is used as a literal fixed seed. The
+        // fallback auto-seed is kept within the same 0..999999999 range the
         // "seed" number field itself uses, so writing it back to that field
         // (see Save in CorruptorScreen) never gets silently clamped or loses
         // precision converting through the UI's Double-based number field.
-        val useSeed = values["useSeed"]?.asBoolean() == true
-        val seedValue = values["seed"]
-        val actualSeed = if (useSeed && seedValue != null) {
-            seedValue.asLong()
+        val declaredSeed = values["seed"]?.asLong() ?: -1L
+        val actualSeed = if (declaredSeed >= 0) {
+            declaredSeed
         } else {
             (System.nanoTime() % 1_000_000_000L).let { if (it < 0) it + 1_000_000_000L else it }
         }
@@ -137,6 +135,25 @@ object CorruptionEngineExecutor {
             "nightmare_engine" -> nightmareEngine(
                 buf,
                 algo = resolveString(op, "algo", values, "Random"),
+                precision = resolveInt(op, "precision", values, 4),
+                alignment = resolveInt(op, "alignment", values, 0),
+                iterations = resolveInt(op, "iterations", values, 200),
+                rangeStart = resolveInt(op, "rangeStart", values, -1),
+                rangeEnd = resolveInt(op, "rangeEnd", values, -1),
+                headerSize = resolveInt(op, "headerSize", values, 0),
+                bigEndian = resolveBool(op, "bigEndian", values, false),
+                min8 = resolveULong(op, "min8", values, 0UL),
+                max8 = resolveULong(op, "max8", values, 0xFFUL),
+                min16 = resolveULong(op, "min16", values, 0UL),
+                max16 = resolveULong(op, "max16", values, 0xFFFFUL),
+                min32 = resolveULong(op, "min32", values, 0UL),
+                max32 = resolveULong(op, "max32", values, 0xFFFFFFFFUL),
+                min64 = resolveULong(op, "min64", values, 0UL),
+                max64 = resolveULong(op, "max64", values, ULong.MAX_VALUE),
+                r = random
+            )
+            "hellgenie_engine" -> hellgenieEngine(
+                buf,
                 precision = resolveInt(op, "precision", values, 4),
                 alignment = resolveInt(op, "alignment", values, 0),
                 iterations = resolveInt(op, "iterations", values, 200),
@@ -573,6 +590,64 @@ object CorruptionEngineExecutor {
                 }
                 "add" -> tiltValue(buf, safeAddress, prec, bigEndian, +1)
                 "subtract" -> tiltValue(buf, safeAddress, prec, bigEndian, -1)
+            }
+        }
+    }
+
+    /**
+     * Ported from RTCV's real RTC_HellgenieEngine.GenerateUnit. It's the
+     * simplest of the four engines: every blast always writes a brand-new
+     * random value within the chosen bit-width's Min/Max bounds — no
+     * Algo choice, no tilt, just SET. Structurally this is the same as the
+     * Nightmare Engine's "Random" mode, but Hellgenie's own address clamp
+     * formula is copied here independently rather than assumed identical,
+     * since porting each engine from its own source is the point.
+     */
+    private fun hellgenieEngine(
+        buf: ByteArray,
+        precision: Int,
+        alignment: Int,
+        iterations: Int,
+        rangeStart: Int,
+        rangeEnd: Int,
+        headerSize: Int,
+        bigEndian: Boolean,
+        min8: ULong, max8: ULong,
+        min16: ULong, max16: ULong,
+        min32: ULong, max32: ULong,
+        min64: ULong, max64: ULong,
+        r: Random
+    ) {
+        if (buf.isEmpty() || iterations <= 0) return
+        val prec = precision.coerceAtLeast(1)
+        if (buf.size < prec) return
+        val align = alignment.coerceAtLeast(0)
+        val header = headerSize.coerceIn(0, buf.size)
+
+        val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
+        val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
+        if (end - start < prec) return
+
+        repeat(iterations) {
+            val address = start + r.nextInt(end - start)
+
+            // --- exact port of RTC_HellgenieEngine.GenerateUnit's address math ---
+            var safeAddress = address - (address % prec) + align
+            if (safeAddress > end - prec && end > prec) {
+                safeAddress = end - (2 * prec) + align // out of range: hit the last aligned address
+            }
+            // --- end port ---
+
+            if (safeAddress < start || safeAddress < 0 || safeAddress + prec > end || safeAddress + prec > buf.size) {
+                return@repeat
+            }
+
+            when (prec) {
+                1 -> writeUnsignedBytes(buf, safeAddress, 1, randomULongInRange(r, min8, max8), bigEndian)
+                2 -> writeUnsignedBytes(buf, safeAddress, 2, randomULongInRange(r, min16, max16), bigEndian)
+                4 -> writeUnsignedBytes(buf, safeAddress, 4, randomULongInRange(r, min32, max32), bigEndian)
+                8 -> writeUnsignedBytes(buf, safeAddress, 8, randomULongInRange(r, min64, max64), bigEndian)
+                else -> for (i in 0 until prec) buf[safeAddress + i] = r.nextInt(256).toByte() // ported "def" fallback
             }
         }
     }

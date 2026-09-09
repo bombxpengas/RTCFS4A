@@ -9,51 +9,120 @@
       "id": "precision",
       "label": "Precision (bytes)",
       "type": "dropdown",
-      "options": ["1", "2", "4", "8"],
+      "options": [
+        "1",
+        "2",
+        "4",
+        "8"
+      ],
       "default": "4",
-      "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit. RTCV defaults to 4 (32-bit) unless a game's memory domain reports a wider bus, which is what \"Unlock Precision\" exposed — pick it directly here instead."
+      "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit. RTCV defaults to 4 (32-bit) unless a game's memory domain reports a wider bus, which is what \"Unlock Precision\" exposed \u2014 pick it directly here instead."
     },
     {
-      "id": "min8", "label": "Min Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "min8",
+      "label": "Min Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "max8", "label": "Max Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "255",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "max8",
+      "label": "Max Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "255",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "min16", "label": "Min Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "min16",
+      "label": "Min Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "max16", "label": "Max Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "65535",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "max16",
+      "label": "Max Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "65535",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "min32", "label": "Min Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "min32",
+      "label": "Min Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "max32", "label": "Max Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "4294967295",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "max32",
+      "label": "Max Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "4294967295",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "min64", "label": "Min Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "0",
-      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand — the default full range is exact until you touch it.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "id": "min64",
+      "label": "Min Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "0",
+      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand \u2014 the default full range is exact until you touch it.",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
-      "id": "max64", "label": "Max Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "18446744073709551615",
+      "id": "max64",
+      "label": "Max Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "18446744073709551615",
       "description": "Same precision caveat as Min Value (64-bit) above.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
       "id": "iterations",
@@ -112,7 +181,7 @@
       "label": "Big Endian",
       "type": "switch",
       "default": "false",
-      "description": "Byte order for the value written at each address — matches the target memory domain's endianness, same as RTCV's per-domain BigEndian flag."
+      "description": "Byte order for the value written at each address \u2014 matches the target memory domain's endianness, same as RTCV's per-domain BigEndian flag."
     },
     {
       "id": "useValueList",
@@ -126,27 +195,21 @@
       "label": "Value List (hex, comma-separated)",
       "type": "text",
       "default": "",
-      "description": "e.g. DEADBEEF, 0x00000000, FFFFFFFF — each blast picks one of these at random instead of a bounded random value. Overrides Min/Max above when on.",
+      "description": "e.g. DEADBEEF, 0x00000000, FFFFFFFF \u2014 each blast picks one of these at random instead of a bounded random value. Overrides Min/Max above when on.",
       "visibleWhenParam": "useValueList",
-      "visibleWhenValues": ["true"]
-    },
-    {
-      "id": "useSeed",
-      "label": "Use Fixed Seed",
-      "type": "switch",
-      "default": "false",
-      "description": "Reuse the same seed to reproduce identical corruption on identical input."
+      "visibleWhenValues": [
+        "true"
+      ]
     },
     {
       "id": "seed",
       "label": "Seed",
       "type": "number",
-      "min": 0,
+      "min": -1,
       "max": 999999999,
       "step": 1,
-      "default": "1",
-      "visibleWhenParam": "useSeed",
-      "visibleWhenValues": ["true"]
+      "default": "-1",
+      "description": "-1 = random (a fresh seed every run, still recorded into this field on Save so Export Config can reproduce it later). Any value 0 or above is used as a fixed seed instead."
     }
   ],
   "operations": [
@@ -162,10 +225,14 @@
         "bigEndian": "bigEndian",
         "useValueList": "useValueList",
         "valueList": "valueList",
-        "min8": "min8", "max8": "max8",
-        "min16": "min16", "max16": "max16",
-        "min32": "min32", "max32": "max32",
-        "min64": "min64", "max64": "max64"
+        "min8": "min8",
+        "max8": "max8",
+        "min16": "min16",
+        "max16": "max16",
+        "min32": "min32",
+        "max32": "max32",
+        "min64": "min64",
+        "max64": "max64"
       }
     }
   ]
