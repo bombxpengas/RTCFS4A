@@ -68,7 +68,21 @@ object EngineJson {
         val root = JSONObject()
         root.put("engineId", engineId)
         val valuesObj = JSONObject()
-        values.forEach { (k, v) -> valuesObj.put(k, v.asString()) }
+        // "lastSeedUsed" is internal bookkeeping (see below) — never exported
+        // as its own field, only used to fill in "seed" when relevant.
+        values.forEach { (k, v) -> if (k != "lastSeedUsed") valuesObj.put(k, v.asString()) }
+
+        // If "seed" is left on auto (-1) but a run has actually happened, export
+        // the concrete seed that run used instead of the literal -1 — so the
+        // config file alone can reproduce that exact result — without ever
+        // touching the live "seed" value itself. That's what keeps the field
+        // parked on auto for next time instead of quietly flipping to manual.
+        val seedValue = values["seed"]?.asLong()
+        val lastSeedUsed = values["lastSeedUsed"]?.asLong()
+        if (seedValue != null && seedValue < 0 && lastSeedUsed != null && lastSeedUsed >= 0) {
+            valuesObj.put("seed", lastSeedUsed.toString())
+        }
+
         root.put("values", valuesObj)
         return root.toString(2)
     }

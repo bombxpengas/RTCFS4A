@@ -1,7 +1,7 @@
 {
   "id": "rtc_hellgenie_engine",
   "name": "RTC Hellgenie Engine",
-  "description": "Ported from RTCV's real RTC_HellgenieEngine.GenerateUnit: the simplest of the ported engines — every blast writes a brand-new random value within the chosen bit-width's Min/Max bounds at an aligned address. No Algo choice, no tilt, just a straight random SET. Its own address-clamp formula is copied directly from that source.",
+  "description": "Ported from RTCV's real RTC_HellgenieEngine.GenerateUnit: the simplest of the ported engines \u2014 every blast writes a brand-new random value within the chosen bit-width's Min/Max bounds at an aligned address. No Algo choice, no tilt, just a straight random SET. Its own address-clamp formula is copied directly from that source.",
   "author": "Ported from RTCV (RTC_HellgenieEngine.cs) for RTCFS4A",
   "version": "1.0",
   "parameters": [
@@ -9,51 +9,120 @@
       "id": "precision",
       "label": "Precision (bytes)",
       "type": "dropdown",
-      "options": ["1", "2", "4", "8"],
+      "options": [
+        "1",
+        "2",
+        "4",
+        "8"
+      ],
       "default": "4",
       "description": "Size of each write: 1 = 8-bit, 2 = 16-bit, 4 = 32-bit, 8 = 64-bit."
     },
     {
-      "id": "min8", "label": "Min Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "min8",
+      "label": "Min Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "max8", "label": "Max Value (8-bit)", "type": "number",
-      "min": 0, "max": 255, "step": 1, "default": "255",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["1"]
+      "id": "max8",
+      "label": "Max Value (8-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 255,
+      "step": 1,
+      "default": "255",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "1"
+      ]
     },
     {
-      "id": "min16", "label": "Min Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "min16",
+      "label": "Min Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "max16", "label": "Max Value (16-bit)", "type": "number",
-      "min": 0, "max": 65535, "step": 1, "default": "65535",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["2"]
+      "id": "max16",
+      "label": "Max Value (16-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 65535,
+      "step": 1,
+      "default": "65535",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "2"
+      ]
     },
     {
-      "id": "min32", "label": "Min Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "0",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "min32",
+      "label": "Min Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "0",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "max32", "label": "Max Value (32-bit)", "type": "number",
-      "min": 0, "max": 4294967295, "step": 1, "default": "4294967295",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["4"]
+      "id": "max32",
+      "label": "Max Value (32-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 4294967295,
+      "step": 1,
+      "default": "4294967295",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "4"
+      ]
     },
     {
-      "id": "min64", "label": "Min Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "0",
-      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand — the default full range is exact until you touch it.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "id": "min64",
+      "label": "Min Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "0",
+      "description": "Very large 64-bit bounds may lose a little precision if you edit them by hand \u2014 the default full range is exact until you touch it.",
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
-      "id": "max64", "label": "Max Value (64-bit)", "type": "number",
-      "min": 0, "max": 18446744073709551615, "step": 1, "default": "18446744073709551615",
+      "id": "max64",
+      "label": "Max Value (64-bit)",
+      "type": "number",
+      "min": 0,
+      "max": 18446744073709551615,
+      "step": 1,
+      "default": "18446744073709551615",
       "description": "Same precision caveat as Min Value (64-bit) above.",
-      "visibleWhenParam": "precision", "visibleWhenValues": ["8"]
+      "visibleWhenParam": "precision",
+      "visibleWhenValues": [
+        "8"
+      ]
     },
     {
       "id": "iterations",
@@ -123,6 +192,17 @@
       "step": 1,
       "default": "-1",
       "description": "-1 = random (a fresh seed every run, still recorded into this field on Save so Export Config can reproduce it later). Any value 0 or above is used as a fixed seed instead."
+    },
+    {
+      "id": "lastSeedUsed",
+      "label": "Last Seed Used",
+      "type": "number",
+      "min": -1,
+      "max": 999999999,
+      "step": 1,
+      "default": "-1",
+      "hidden": true,
+      "description": "Internal bookkeeping: the actual seed the most recent run used, recorded here (not in Seed itself) so Export Config can reproduce it without flipping Seed out of auto mode."
     }
   ],
   "operations": [
@@ -136,10 +216,14 @@
         "rangeEnd": "rangeEnd",
         "headerSize": "headerSize",
         "bigEndian": "bigEndian",
-        "min8": "min8", "max8": "max8",
-        "min16": "min16", "max16": "max16",
-        "min32": "min32", "max32": "max32",
-        "min64": "min64", "max64": "max64"
+        "min8": "min8",
+        "max8": "max8",
+        "min16": "min16",
+        "max16": "max16",
+        "min32": "min32",
+        "max32": "max32",
+        "min64": "min64",
+        "max64": "max64"
       }
     }
   ]

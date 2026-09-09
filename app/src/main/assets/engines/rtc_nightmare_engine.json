@@ -204,6 +204,17 @@
       "step": 1,
       "default": "-1",
       "description": "-1 = random (a fresh seed every run, still recorded into this field on Save so Export Config can reproduce it later). Any value 0 or above is used as a fixed seed instead."
+    },
+    {
+      "id": "lastSeedUsed",
+      "label": "Last Seed Used",
+      "type": "number",
+      "min": -1,
+      "max": 999999999,
+      "step": 1,
+      "default": "-1",
+      "hidden": true,
+      "description": "Internal bookkeeping: the actual seed the most recent run used, recorded here (not in Seed itself) so Export Config can reproduce it without flipping Seed out of auto mode."
     }
   ],
   "operations": [

@@ -335,12 +335,13 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                             corrupted = result.bytes
                             isProcessing = false
 
-                            // Record whatever seed actually produced this file —
-                            // fixed or not — so Export Config (Settings tab) can
-                            // capture the exact seed that made this result,
-                            // instead of only ever reflecting a manually-typed one.
-                            if (engineValues.containsKey("seed")) {
-                                engineValues["seed"] = ParamValue.of(result.seedUsed.toString())
+                            // Record whatever seed actually produced this file into
+                            // the hidden bookkeeping slot, not the visible "seed"
+                            // field itself — that's what lets Export Config (Settings
+                            // tab) capture the exact seed used while "seed" stays on
+                            // auto (-1) for next time instead of flipping to manual.
+                            if (engineValues.containsKey("lastSeedUsed")) {
+                                engineValues["lastSeedUsed"] = ParamValue.of(result.seedUsed.toString())
                             }
 
                             val reuse = lastSavedUri
@@ -436,10 +437,11 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
 
                                     // Same reasoning as the single-file Save: capture
                                     // whatever seed actually got used (from the last
-                                    // file processed) so Export Config can reflect it.
+                                    // file processed) into the hidden bookkeeping slot,
+                                    // leaving the visible "seed" field on auto.
                                     lastSeedUsed?.let { seed ->
-                                        if (engineValues.containsKey("seed")) {
-                                            engineValues["seed"] = ParamValue.of(seed.toString())
+                                        if (engineValues.containsKey("lastSeedUsed")) {
+                                            engineValues["lastSeedUsed"] = ParamValue.of(seed.toString())
                                         }
                                     }
 

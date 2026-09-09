@@ -171,6 +171,17 @@ object CorruptionEngineExecutor {
                 max64 = resolveULong(op, "max64", values, ULong.MAX_VALUE),
                 r = random
             )
+            "pipe_engine" -> pipeEngine(
+                buf,
+                precision = resolveInt(op, "precision", values, 4),
+                alignment = resolveInt(op, "alignment", values, 0),
+                sourceByte = resolveInt(op, "sourceByte", values, -1),
+                iterations = resolveInt(op, "iterations", values, 200),
+                rangeStart = resolveInt(op, "rangeStart", values, -1),
+                rangeEnd = resolveInt(op, "rangeEnd", values, -1),
+                headerSize = resolveInt(op, "headerSize", values, 0),
+                r = random
+            )
             "cluster_engine" -> clusterEngine(
                 buf,
                 shuffleType = resolveString(op, "shuffleType", values, "Random"),
@@ -649,6 +660,71 @@ object CorruptionEngineExecutor {
                 8 -> writeUnsignedBytes(buf, safeAddress, 8, randomULongInRange(r, min64, max64), bigEndian)
                 else -> for (i in 0 until prec) buf[safeAddress + i] = r.nextInt(256).toByte() // ported "def" fallback
             }
+        }
+    }
+
+    /**
+     * Ported from RTCV's real RTC_PipeEngine.GenerateUnit: reads a
+     * Precision-byte value from one "source" address and copies it,
+     * unmodified, into a run of random destination addresses — the classic
+     * "pipe one value everywhere" broadcast effect. The original re-reads
+     * a live, continuously-tracked source every tick (StoreType.CONTINUOUS)
+     * and can pull that source from a completely different memory domain;
+     * neither applies to a static single-file transform, so this takes one
+     * snapshot of the source bytes up front and pipes that same snapshot
+     * into every destination this run picks. [sourceByte] of -1 picks that
+     * source address randomly once per run; 0 or above uses it directly —
+     * handy for deliberately broadcasting a byte offset you already know is
+     * interesting. Both the source and destination address math are exact
+     * ports of the original's own (precision-based) clamp formula.
+     */
+    private fun pipeEngine(
+        buf: ByteArray,
+        precision: Int,
+        alignment: Int,
+        sourceByte: Int,
+        iterations: Int,
+        rangeStart: Int,
+        rangeEnd: Int,
+        headerSize: Int,
+        r: Random
+    ) {
+        if (buf.isEmpty() || iterations <= 0) return
+        val prec = precision.coerceAtLeast(1)
+        if (buf.size < prec) return
+        val align = alignment.coerceAtLeast(0)
+        val header = headerSize.coerceIn(0, buf.size)
+
+        val start = if (rangeStart >= 0) rangeStart.coerceIn(0, buf.size) else header
+        val end = if (rangeEnd >= 0) rangeEnd.coerceIn(0, buf.size) else buf.size
+        if (end - start < prec) return
+
+        // --- exact port of the source ("pipe start") address math ---
+        val rawSourceAddress = if (sourceByte >= 0) sourceByte else start + r.nextInt(end - start)
+        var safeSourceAddress = rawSourceAddress - (rawSourceAddress % prec) + align
+        if (safeSourceAddress > buf.size - prec && buf.size > prec) {
+            safeSourceAddress = buf.size - (2 * prec) + align
+        }
+        // --- end port ---
+        if (safeSourceAddress < 0 || safeSourceAddress + prec > buf.size) return
+
+        val sourceBytes = buf.copyOfRange(safeSourceAddress, safeSourceAddress + prec)
+
+        repeat(iterations) {
+            val address = start + r.nextInt(end - start)
+
+            // --- exact port of the destination address math ---
+            var safeAddress = address - (address % prec) + align
+            if (safeAddress > end - prec && end > prec) {
+                safeAddress = end - (2 * prec) + align
+            }
+            // --- end port ---
+
+            if (safeAddress < start || safeAddress < 0 || safeAddress + prec > end || safeAddress + prec > buf.size) {
+                return@repeat
+            }
+
+            sourceBytes.copyInto(buf, safeAddress)
         }
     }
 

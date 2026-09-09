@@ -164,7 +164,8 @@ private fun EngineFormatHelp() {
             Text(
                 "Each operation needs: type (random_bytes, bit_flip, chunk_shuffle, chunk_reverse, " +
                     "byte_shift, zero_out, duplicate_block, random_block_overwrite, byte_corrupt, " +
-                    "text_replace_literal, vector_engine, nightmare_engine, hellgenie_engine, or " +
+                    "text_replace_literal, vector_engine, nightmare_engine, hellgenie_engine, " +
+                    "pipe_engine, or " +
                     "cluster_engine) and a \"params\" object mapping that operation's argument names to " +
                     "one of your parameter ids. An optional \"enabledParam\" names a switch parameter that " +
                     "turns the whole operation on/off.",

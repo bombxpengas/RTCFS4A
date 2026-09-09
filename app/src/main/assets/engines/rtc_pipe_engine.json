@@ -1,0 +1,114 @@
+{
+  "id": "rtc_pipe_engine",
+  "name": "RTC Pipe Engine",
+  "description": "Ported from RTCV's real RTC_PipeEngine.GenerateUnit: takes the Precision-byte value at one source address and copies it, unmodified, into a run of random destination addresses — the classic \"pipe one value everywhere\" broadcast effect RTCV is known for. The original continuously re-reads a live, possibly cross-domain source every tick; this snapshots the source once and pipes that same value into every destination the run picks.",
+  "author": "Ported from RTCV (RTC_PipeEngine.cs) for RTCFS4A",
+  "version": "1.0",
+  "parameters": [
+    {
+      "id": "precision",
+      "label": "Precision (bytes)",
+      "type": "dropdown",
+      "options": ["1", "2", "4", "8"],
+      "default": "4",
+      "description": "Size of the value copied from source to each destination."
+    },
+    {
+      "id": "sourceByte",
+      "label": "Source Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = pick one random source address for this whole run. 0 or above uses that exact byte offset — handy for deliberately broadcasting a specific spot you already know is interesting."
+    },
+    {
+      "id": "iterations",
+      "label": "Blast Count",
+      "type": "slider",
+      "min": 1,
+      "max": 1000000,
+      "step": 1,
+      "default": "200",
+      "unit": " blasts",
+      "description": "How many destinations get the source value piped into them. Use the number box next to the slider for exact values."
+    },
+    {
+      "id": "alignment",
+      "label": "Alignment",
+      "type": "number",
+      "min": 0,
+      "max": 1000000,
+      "step": 1,
+      "default": "0",
+      "description": "Sub-offset added after rounding down to Precision, applied to both the source and every destination address, exactly as in the original."
+    },
+    {
+      "id": "rangeStart",
+      "label": "Start Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (right after Header Size below). Restricts where both the random source (if Source Byte is -1) and destinations can land."
+    },
+    {
+      "id": "rangeEnd",
+      "label": "End Byte",
+      "type": "number",
+      "min": -1,
+      "max": 100000000,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = auto (end of file)."
+    },
+    {
+      "id": "headerSize",
+      "label": "Header Size",
+      "type": "number",
+      "min": 0,
+      "max": 100000,
+      "step": 1,
+      "default": "16",
+      "unit": "bytes",
+      "description": "Bytes to leave alone at the start of the file when Start Byte is -1. 16 for .nes/.fds, 512 for headered .smc, 0 for a headerless ROM."
+    },
+    {
+      "id": "seed",
+      "label": "Seed",
+      "type": "number",
+      "min": -1,
+      "max": 999999999,
+      "step": 1,
+      "default": "-1",
+      "description": "-1 = random (a fresh seed every run, still recorded for Export Config to reproduce it later). Any value 0 or above is used as a fixed seed instead."
+    },
+    {
+      "id": "lastSeedUsed",
+      "label": "Last Seed Used",
+      "type": "number",
+      "min": -1,
+      "max": 999999999,
+      "step": 1,
+      "default": "-1",
+      "hidden": true,
+      "description": "Internal bookkeeping: the actual seed the most recent run used, recorded here (not in Seed itself) so Export Config can reproduce it without flipping Seed out of auto mode."
+    }
+  ],
+  "operations": [
+    {
+      "type": "pipe_engine",
+      "params": {
+        "precision": "precision",
+        "sourceByte": "sourceByte",
+        "iterations": "iterations",
+        "alignment": "alignment",
+        "rangeStart": "rangeStart",
+        "rangeEnd": "rangeEnd",
+        "headerSize": "headerSize"
+      }
+    }
+  ]
+}
