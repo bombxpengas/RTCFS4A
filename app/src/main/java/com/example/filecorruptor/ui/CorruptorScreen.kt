@@ -99,6 +99,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     var batchRunning by remember { mutableStateOf(false) }
     var batchProgress by remember { mutableStateOf(0) }
     var batchResultMessage by remember { mutableStateOf<String?>(null) }
+    var showBatchConfirm by remember { mutableStateOf(false) }
 
     val openTreeLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -231,7 +232,7 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            "Each one gets its own random draw from the current engine settings — a fixed seed applies the exact same transform to every file instead.",
+                            "Each file gets its own random draw from the current engine settings (a fixed seed applies the same transform to all of them instead). Corrupting replaces each original file in place — there's no undo, so make sure this is a folder you're fine overwriting.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -382,67 +383,77 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
 
                 Button(
-                    onClick = {
-                        val filesToProcess = batchFiles
-                        saveScope.launch {
-                            batchRunning = true
-                            batchProgress = 0
-                            batchResultMessage = null
-                            var succeeded = 0
-                            var failed = 0
-                            var lastSeedUsed: Long? = null
-
-                            for (doc in filesToProcess) {
-                                val outcome = runCatching {
-                                    val bytes = context.contentResolver.openInputStream(doc.uri)
-                                        ?.use { it.readBytes() } ?: error("could not read file")
-                                    val result = withContext(Dispatchers.Default) {
-                                        CorruptionEngineExecutor.runWithSeed(bytes, engine, currentValues)
-                                    }
-                                    lastSeedUsed = result.seedUsed
-
-                                    val originalName = doc.name ?: "file"
-                                    val base = originalName.substringBeforeLast('.', originalName)
-                                    val ext = originalName.substringAfterLast('.', "")
-                                    val outName = if (ext.isNotEmpty()) "${base}_corrupted.$ext" else "${base}_corrupted"
-
-                                    val parent = doc.parentFile ?: error("no parent folder")
-                                    // Re-running the same batch overwrites cleanly instead of piling up duplicates.
-                                    parent.findFile(outName)?.delete()
-                                    val outDoc = parent.createFile("application/octet-stream", outName)
-                                        ?: error("could not create output file")
-                                    context.contentResolver.openOutputStream(outDoc.uri, "wt")
-                                        ?.use { it.write(result.bytes) } ?: error("could not open output stream")
-                                }
-                                if (outcome.isSuccess) succeeded++ else failed++
-                                batchProgress++
-                            }
-
-                            // Same reasoning as the single-file Save: capture
-                            // whatever seed actually got used (from the last
-                            // file processed) so Export Config can reflect it.
-                            lastSeedUsed?.let { seed ->
-                                if (engineValues.containsKey("seed")) {
-                                    engineValues["seed"] = ParamValue.of(seed.toString())
-                                }
-                            }
-
-                            batchRunning = false
-                            batchResultMessage = "Done: $succeeded corrupted" +
-                                (if (failed > 0) ", $failed failed" else "") +
-                                " out of ${filesToProcess.size}."
-                        }
-                    },
+                    onClick = { showBatchConfirm = true },
                     enabled = !batchRunning,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Filled.Save, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Corrupt All & Save")
+                    Text("Corrupt All (Replace Files)")
                 }
 
                 batchResultMessage?.let {
                     AssistChip(onClick = { batchResultMessage = null }, label = { Text(it) })
+                }
+
+                if (showBatchConfirm) {
+                    val filesToProcess = batchFiles
+                    AlertDialog(
+                        onDismissRequest = { showBatchConfirm = false },
+                        title = { Text("Replace ${filesToProcess.size} file${if (filesToProcess.size == 1) "" else "s"}?") },
+                        text = {
+                            Text("Every file found will be corrupted and written straight back over the original. There's no undo — make sure you don't need these copies as-is.")
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                showBatchConfirm = false
+                                saveScope.launch {
+                                    batchRunning = true
+                                    batchProgress = 0
+                                    batchResultMessage = null
+                                    var succeeded = 0
+                                    var failed = 0
+                                    var lastSeedUsed: Long? = null
+
+                                    for (doc in filesToProcess) {
+                                        val outcome = runCatching {
+                                            val bytes = context.contentResolver.openInputStream(doc.uri)
+                                                ?.use { it.readBytes() } ?: error("could not read file")
+                                            val result = withContext(Dispatchers.Default) {
+                                                CorruptionEngineExecutor.runWithSeed(bytes, engine, currentValues)
+                                            }
+                                            lastSeedUsed = result.seedUsed
+
+                                            // Replace the original in place — "wt" truncates
+                                            // first so a smaller result never leaves trailing
+                                            // bytes from the original behind.
+                                            context.contentResolver.openOutputStream(doc.uri, "wt")
+                                                ?.use { it.write(result.bytes) } ?: error("could not open output stream")
+                                        }
+                                        if (outcome.isSuccess) succeeded++ else failed++
+                                        batchProgress++
+                                    }
+
+                                    // Same reasoning as the single-file Save: capture
+                                    // whatever seed actually got used (from the last
+                                    // file processed) so Export Config can reflect it.
+                                    lastSeedUsed?.let { seed ->
+                                        if (engineValues.containsKey("seed")) {
+                                            engineValues["seed"] = ParamValue.of(seed.toString())
+                                        }
+                                    }
+
+                                    batchRunning = false
+                                    batchResultMessage = "Done: $succeeded replaced" +
+                                        (if (failed > 0) ", $failed failed" else "") +
+                                        " out of ${filesToProcess.size}."
+                                }
+                            }) { Text("Replace them") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showBatchConfirm = false }) { Text("Cancel") }
+                        }
+                    )
                 }
             }
         }
