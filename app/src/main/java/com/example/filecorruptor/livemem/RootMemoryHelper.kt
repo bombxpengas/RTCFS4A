@@ -1,0 +1,111 @@
+package com.example.filecorruptor.livemem
+
+import android.content.Context
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+
+data class LiveProcess(val pid: Int, val name: String)
+
+data class MemoryRegion(val start: Long, val end: Long, val perms: String, val path: String) {
+    val size: Long get() = end - start
+    val isWritable: Boolean get() = perms.length >= 2 && perms[0] == 'r' && perms[1] == 'w'
+}
+
+/**
+ * Talks to a small root-privileged native helper binary (see
+ * app/src/main/cpp/rtmem_helper.c) that does the actual ptrace-based
+ * process-memory read/write. The helper ships disguised as a lib*.so under
+ * jniLibs purely so Android's own packaging pipeline installs it with
+ * executable permissions automatically — it's a real standalone program,
+ * never loaded as a library, and only ever invoked through `su -c`.
+ *
+ * This is the same fundamental technique tools like GameGuardian use on
+ * rooted Android. There is no Android equivalent to BizHawk's cooperative
+ * "memory domain" API the real RTCV integrates with, so for an arbitrary,
+ * non-cooperating emulator app the only option is a direct OS-level attach,
+ * gated entirely behind root the device owner already granted.
+ *
+ * Every function here does blocking process I/O — always call from a
+ * background dispatcher (e.g. Dispatchers.IO), never the main thread.
+ */
+object RootMemoryHelper {
+
+    private fun helperPath(context: Context): String =
+        File(context.applicationInfo.nativeLibraryDir, "librtmemhelper.so").absolutePath
+
+    private fun runAsRoot(context: Context, vararg args: String): List<String> {
+        val command = (listOf(helperPath(context)) + args).joinToString(" ") { arg ->
+            "'" + arg.replace("'", "'\\''") + "'"
+        }
+        return runCatching {
+            val process = ProcessBuilder("su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val lines = BufferedReader(InputStreamReader(process.inputStream)).readLines()
+            process.waitFor()
+            lines
+        }.getOrDefault(listOf("ERR could not invoke su — is this device rooted?"))
+    }
+
+    /** Blocking; call from a background dispatcher. */
+    fun hasRoot(): Boolean = runCatching {
+        val process = ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start()
+        val output = process.inputStream.bufferedReader().readText()
+        process.waitFor()
+        output.contains("uid=0")
+    }.getOrDefault(false)
+
+    fun listProcesses(context: Context): List<LiveProcess> {
+        return runAsRoot(context, "list_processes").mapNotNull { line ->
+            val parts = line.split("\t", limit = 2)
+            if (parts.size != 2) return@mapNotNull null
+            val pid = parts[0].toIntOrNull() ?: return@mapNotNull null
+            // cmdline is NUL-separated argv; keep just argv[0].
+            val name = parts[1].substringBefore('\u0000').ifBlank { "pid $pid" }
+            LiveProcess(pid, name)
+        }.sortedBy { it.name.lowercase() }
+    }
+
+    fun listMemoryMaps(context: Context, pid: Int): List<MemoryRegion> {
+        return runAsRoot(context, "list_maps", pid.toString()).mapNotNull { line ->
+            // e.g. "12c00000-12e00000 rw-p 00000000 00:00 0     [heap]"
+            val parts = line.trim().split(Regex("\\s+"), limit = 6)
+            if (parts.size < 2) return@mapNotNull null
+            val range = parts[0].split("-")
+            if (range.size != 2) return@mapNotNull null
+            val start = range[0].toLongOrNull(16) ?: return@mapNotNull null
+            val end = range[1].toLongOrNull(16) ?: return@mapNotNull null
+            val perms = parts.getOrElse(1) { "" }
+            val path = parts.getOrElse(5) { "" }
+            MemoryRegion(start, end, perms, path)
+        }
+    }
+
+    /** Reads [length] bytes at [address] in [pid]'s memory, or null on failure. */
+    fun readMemory(context: Context, pid: Int, address: Long, length: Int): ByteArray? {
+        val outFile = File(context.cacheDir, "rtmem_read_${System.nanoTime()}.bin")
+        val result = runAsRoot(
+            context, "read", pid.toString(), address.toString(16), length.toString(), outFile.absolutePath
+        )
+        if (result.firstOrNull()?.trim() != "OK") {
+            outFile.delete()
+            return null
+        }
+        val bytes = runCatching { outFile.readBytes() }.getOrNull()
+        outFile.delete()
+        return bytes
+    }
+
+    /** Writes [bytes] into [pid]'s memory starting at [address]. Returns success. */
+    fun writeMemory(context: Context, pid: Int, address: Long, bytes: ByteArray): Boolean {
+        val inFile = File(context.cacheDir, "rtmem_write_${System.nanoTime()}.bin")
+        return try {
+            inFile.writeBytes(bytes)
+            val result = runAsRoot(context, "write", pid.toString(), address.toString(16), inFile.absolutePath)
+            result.firstOrNull()?.trim() == "OK"
+        } finally {
+            inFile.delete()
+        }
+    }
+}

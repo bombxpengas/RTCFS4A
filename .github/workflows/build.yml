@@ -27,6 +27,15 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses > /dev/null || true
 
+      # The Live RAM feature ships a small native helper (app/src/main/cpp),
+      # built via CMake. Neither the NDK nor CMake are part of the base SDK
+      # setup-android installs, so the native build step fails without this.
+      # Versions pinned here match app/build.gradle.kts's ndkVersion and the
+      # cmake { version = ... } in app/src/main/cpp's Gradle wiring — bump
+      # both places together if you ever change one.
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+
       # Pins an exact Gradle version and puts it on PATH, handles caching of
       # ~/.gradle automatically, and is used for every `gradle`/`./gradlew`
       # call below. This avoids depending on whatever Gradle happens to be

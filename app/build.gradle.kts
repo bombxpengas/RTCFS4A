@@ -7,6 +7,12 @@ plugins {
 android {
     namespace = "com.example.filecorruptor"
     compileSdk = 34
+    // Pinned so a local build (Android Studio) and CI always compile the
+    // native memory helper (see app/src/main/cpp) against the identical NDK
+    // — otherwise which NDK gets auto-detected can silently drift between
+    // machines, the same class of problem this repo already pins Gradle's
+    // own version to avoid.
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.example.filecorruptor"
@@ -14,6 +20,20 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            // The native memory helper only ever runs on a real device via
+            // `su`, so there's no need to build it for the emulator's x86
+            // ABIs — arm is what every real Android phone/tablet uses.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {

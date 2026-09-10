@@ -7,6 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -21,15 +22,17 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.ui.CorruptorScreen
+import com.example.filecorruptor.ui.LiveMemoryScreen
 import com.example.filecorruptor.ui.SettingsScreen
 import com.example.filecorruptor.ui.theme.FileCorruptorTheme
 
 private sealed class Destination(val route: String, val label: String) {
     data object Corruptor : Destination("corruptor", "Corruptor")
+    data object LiveMemory : Destination("live", "Live RAM")
     data object Settings : Destination("settings", "Settings")
 }
 
-private val destinations = listOf(Destination.Corruptor, Destination.Settings)
+private val destinations = listOf(Destination.Corruptor, Destination.LiveMemory, Destination.Settings)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,7 +80,11 @@ private fun AppRoot() {
                         },
                         icon = {
                             Icon(
-                                if (dest is Destination.Corruptor) Icons.Filled.BrokenImage else Icons.Filled.Settings,
+                                when (dest) {
+                                    is Destination.Corruptor -> Icons.Filled.BrokenImage
+                                    is Destination.LiveMemory -> Icons.Filled.Memory
+                                    is Destination.Settings -> Icons.Filled.Settings
+                                },
                                 contentDescription = dest.label
                             )
                         },
@@ -93,6 +100,7 @@ private fun AppRoot() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Destination.Corruptor.route) { CorruptorScreen(engineViewModel) }
+            composable(Destination.LiveMemory.route) { LiveMemoryScreen(engineViewModel) }
             composable(Destination.Settings.route) { SettingsScreen(engineViewModel) }
         }
     }
