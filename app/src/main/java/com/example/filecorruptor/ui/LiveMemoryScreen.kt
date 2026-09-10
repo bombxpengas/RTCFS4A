@@ -37,6 +37,24 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Generously covers PS1/N64/PSP/DS-sized console RAM while excluding most
+ *  bloated ART/Dalvik heap spaces, which can easily run into the hundreds
+ *  of MB on a modern device and are never what you actually want to poke. */
+private const val MAX_LIKELY_RAM_BYTES = 128L * 1024 * 1024
+
+/** Denylist of path substrings that mark a region as Android-runtime/system
+ *  plumbing rather than anything belonging to the emulator's own game
+ *  state — corrupting these just crashes the process almost every time. */
+private val NOISY_PATH_MARKERS = listOf(
+    "dalvik", "/apex/", "/system/", "/vendor/", ".so", ".dex", ".vdex", ".odex", ".oat", ".art",
+    "/dev/", "[vdso]", "[vvar]", "[vsyscall]", "[stack", "jit-cache", "/data/dalvik-cache", "/linker"
+)
+
+private fun looksLikeNoise(region: MemoryRegion): Boolean {
+    val p = region.path.lowercase()
+    return NOISY_PATH_MARKERS.any { marker -> p.contains(marker) }
+}
+
 private fun formatSize(bytes: Long): String = when {
     bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
     bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
@@ -64,6 +82,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var lastCycleError by remember { mutableStateOf<String?>(null) }
     var isErrorStatus by remember { mutableStateOf(false) }
 
     var liveRunning by remember { mutableStateOf(false) }
@@ -255,16 +274,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
             selectedProcess?.let { proc ->
                 Text("Target: ${proc.name} (pid ${proc.pid})", style = MaterialTheme.typography.titleMedium)
 
+                var showAllRegions by remember { mutableStateOf(false) }
+
                 FilledTonalButton(
                     onClick = {
                         regionLoading = true
                         scope.launch {
                             val all = withContext(Dispatchers.IO) { RootMemoryHelper.listMemoryMaps(context, proc.pid) }
-                            // Only regions actually worth corrupting: writable,
-                            // and at least 4KB (anything smaller is very unlikely
-                            // to be a console's whole RAM).
-                            regions = all.filter { it.isWritable && it.size >= 4096 }
-                                .sortedByDescending { it.size }
+                            regions = all.sortedByDescending { it.size }
                             regionLoading = false
                         }
                     },
@@ -277,23 +294,48 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
                 if (regionLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
 
+                val visibleRegions = remember(regions, showAllRegions) {
+                    if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
+                    else regions.filter { it.isWritable && it.size in 4096..MAX_LIKELY_RAM_BYTES && !looksLikeNoise(it) }
+                }
+
                 if (regions.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = showAllRegions, onCheckedChange = { showAllRegions = it })
+                        Text(
+                            "Show everything (including Dalvik/ART, system libs, and >128MB regions)",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Text(
+                        "Hiding ${regions.size - visibleRegions.size} of ${regions.size} regions by default — " +
+                            "an emulator's own process also contains the Android runtime's Dalvik/ART heap " +
+                            "spaces, mapped system libraries, and other internals that aren't the emulated " +
+                            "console's RAM and will almost always just crash the target if corrupted.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                if (visibleRegions.isNotEmpty()) {
                     Text(
                         "Pick the region whose size matches the console you're emulating — " +
                             "e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
-                            "There's no reliable way to know for certain without trying it.",
+                            "Unlabeled anonymous regions (marked below) are the best bet — a native " +
+                            "emulator core's own malloc'd RAM buffer usually shows up that way, with " +
+                            "no file path at all. There's no way to know for certain without trying it.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Card {
                         LazyColumn(Modifier.heightIn(max = 320.dp)) {
-                            items(regions) { region ->
+                            items(visibleRegions) { region ->
                                 ListItem(
                                     headlineContent = { Text(formatSize(region.size)) },
                                     supportingContent = {
                                         Text(
                                             "0x${region.start.toString(16)} - 0x${region.end.toString(16)}  ${region.perms}" +
-                                                if (region.path.isNotBlank()) "  ${region.path}" else "  [anonymous]"
+                                                if (region.path.isNotBlank()) "  ${region.path}" else "  [anonymous — likely candidate]"
                                         )
                                     },
                                     trailingContent = {
@@ -338,16 +380,34 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         return
                     }
                     scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
-                                ?: return@withContext false
-                            val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, currentValues)
-                            if (engineValues.containsKey("lastSeedUsed")) {
-                                engineValues["lastSeedUsed"] = ParamValue.of(result.seedUsed.toString())
+                        val outcome = withContext(Dispatchers.IO) {
+                            // Catches Throwable on purpose, not just Exception —
+                            // a very large region (an ART/Dalvik heap someone
+                            // picked via "Show everything") can throw
+                            // OutOfMemoryError here, since this cycle briefly
+                            // holds the region's bytes twice (original +
+                            // corrupted). That used to crash the whole app;
+                            // now it's just a failed attempt with a clear reason.
+                            runCatching {
+                                val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
+                                    ?: error("could not read that region — it may have moved or the process may be gone")
+                                val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, currentValues)
+                                if (engineValues.containsKey("lastSeedUsed")) {
+                                    engineValues["lastSeedUsed"] = ParamValue.of(result.seedUsed.toString())
+                                }
+                                if (!RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)) {
+                                    error("write failed")
+                                }
                             }
-                            RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)
                         }
-                        onDone(ok)
+                        lastCycleError = outcome.exceptionOrNull()?.let { e ->
+                            if (e is OutOfMemoryError) {
+                                "Out of memory — ${formatSize(region.size)} is too large for this device to hold twice at once. Try a smaller region."
+                            } else {
+                                e.message ?: "Unknown error"
+                            }
+                        }
+                        onDone(outcome.isSuccess)
                     }
                 }
 
@@ -357,7 +417,8 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         runOneCycle { ok ->
                             isBusy = false
                             isErrorStatus = !ok
-                            statusMessage = if (ok) "Corrupted ${formatSize(region.size)} once." else "Read/write failed — process may have exited or region is no longer valid."
+                            statusMessage = if (ok) "Corrupted ${formatSize(region.size)} once."
+                            else lastCycleError ?: "Read/write failed — process may have exited or region is no longer valid."
                         }
                     },
                     enabled = !isBusy && !liveRunning,
@@ -414,16 +475,28 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                 liveRunning = false
                                 break
                             }
-                            val ok = withContext(Dispatchers.IO) {
-                                val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
-                                    ?: return@withContext false
-                                val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, engineValues.toMap())
-                                RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)
+                            val outcome = withContext(Dispatchers.IO) {
+                                // Same OOM-safety reasoning as Corrupt Once —
+                                // a bad region choice must stop the loop
+                                // cleanly, not crash the app mid-loop.
+                                runCatching {
+                                    val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
+                                        ?: error("could not read that region")
+                                    val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, engineValues.toMap())
+                                    if (!RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)) {
+                                        error("write failed")
+                                    }
+                                }
                             }
-                            if (!ok) {
+                            if (outcome.isFailure) {
                                 liveRunning = false
                                 isErrorStatus = true
-                                statusMessage = "Live corrupting stopped — the process may have exited."
+                                val e = outcome.exceptionOrNull()
+                                statusMessage = when {
+                                    e is OutOfMemoryError ->
+                                        "Live corrupting stopped — out of memory. ${formatSize(region.size)} is too large for this device to hold twice at once."
+                                    else -> "Live corrupting stopped — the process may have exited, or the region is no longer valid."
+                                }
                                 break
                             }
                             tickCount++
