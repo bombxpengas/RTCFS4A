@@ -36,6 +36,21 @@ android {
         }
     }
 
+    // AGP has defaulted to keeping native .so files compressed inside the
+    // APK's zip (loaded via direct mmap) rather than extracted to a real
+    // file on disk since AGP 4.2. That's fine for an actual shared library
+    // loaded through System.loadLibrary(), but librtmemhelper.so is really
+    // a standalone executable we invoke by path via `su -c` — with the
+    // default packaging it likely never exists as a runnable file at
+    // nativeLibraryDir at all, which silently breaks every helper call,
+    // not just process listing. This forces the old "always extract to
+    // disk at install time" behavior back on.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false

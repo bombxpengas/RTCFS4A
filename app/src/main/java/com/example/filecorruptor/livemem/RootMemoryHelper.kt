@@ -31,21 +31,38 @@ data class MemoryRegion(val start: Long, val end: Long, val perms: String, val p
  */
 object RootMemoryHelper {
 
-    private fun helperPath(context: Context): String =
+    fun helperPath(context: Context): String =
         File(context.applicationInfo.nativeLibraryDir, "librtmemhelper.so").absolutePath
 
-    private fun runAsRoot(context: Context, vararg args: String): List<String> {
-        val command = (listOf(helperPath(context)) + args).joinToString(" ") { arg ->
+    /** Plain (non-root) file check — if this is false, nothing else here can
+     *  possibly work, regardless of root/SELinux, because there's simply no
+     *  file to execute. See the packaging.jniLibs.useLegacyPackaging note in
+     *  build.gradle.kts for why this could be false on some AGP defaults. */
+    fun helperExists(context: Context): Boolean = File(helperPath(context)).exists()
+
+    private fun buildCommand(context: Context, args: List<String>): String =
+        (listOf(helperPath(context)) + args).joinToString(" ") { arg ->
             "'" + arg.replace("'", "'\\''") + "'"
         }
+
+    private fun runAsRoot(context: Context, vararg args: String): List<String> =
+        runRawDiagnostic(context, *args).lines().filter { it.isNotEmpty() }
+
+    /** Same as [runAsRoot] but returns the exact raw stdout+stderr as one
+     *  string, unfiltered and unparsed — for a debug panel when something
+     *  isn't working and you need to see exactly what actually happened
+     *  (su rejected the request, the file wasn't found, a permission error
+     *  from ptrace/SELinux, etc.) instead of just an empty result. */
+    fun runRawDiagnostic(context: Context, vararg args: String): String {
+        val command = buildCommand(context, args.toList())
         return runCatching {
             val process = ProcessBuilder("su", "-c", command)
                 .redirectErrorStream(true)
                 .start()
-            val lines = BufferedReader(InputStreamReader(process.inputStream)).readLines()
-            process.waitFor()
-            lines
-        }.getOrDefault(listOf("ERR could not invoke su — is this device rooted?"))
+            val output = BufferedReader(InputStreamReader(process.inputStream)).readText()
+            val exitCode = process.waitFor()
+            if (output.isBlank()) "(no output, exit code $exitCode)" else output
+        }.getOrElse { e -> "ERR could not invoke su: ${e.message} — is this device rooted?" }
     }
 
     /** Blocking; call from a background dispatcher. */

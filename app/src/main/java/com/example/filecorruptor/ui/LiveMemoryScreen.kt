@@ -127,6 +127,68 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
             }
         } else {
+            var showDiagnostics by remember { mutableStateOf(false) }
+            var diagnosticText by remember { mutableStateOf<String?>(null) }
+            val helperExists = remember { RootMemoryHelper.helperExists(context) }
+
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = if (helperExists) MaterialTheme.colorScheme.surfaceVariant
+                    else MaterialTheme.colorScheme.errorContainer
+                )
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (helperExists) "Native helper found on disk" else "Native helper missing on disk",
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f),
+                            color = if (helperExists) MaterialTheme.colorScheme.onSurfaceVariant
+                            else MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        TextButton(onClick = { showDiagnostics = !showDiagnostics }) {
+                            Text(if (showDiagnostics) "Hide" else "Diagnostics")
+                        }
+                    }
+                    if (!helperExists) {
+                        Text(
+                            "This means every command below will silently fail, not just process " +
+                                "listing — there's no file to run yet. Reinstall the app with the " +
+                                "latest build (packaging.jniLibs.useLegacyPackaging must be on so this " +
+                                "gets extracted to disk at install time) and check again.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                    if (showDiagnostics) {
+                        Text(
+                            "Expected path:\n${RootMemoryHelper.helperPath(context)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        TextButton(onClick = {
+                            scope.launch {
+                                diagnosticText = "Running…"
+                                diagnosticText = withContext(Dispatchers.IO) {
+                                    RootMemoryHelper.runRawDiagnostic(context, "list_processes")
+                                }
+                            }
+                        }) { Text("Run list_processes raw") }
+                        diagnosticText?.let {
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 220.dp)
+                                    .verticalScroll(rememberScrollState())
+                            )
+                        }
+                    }
+                }
+            }
+
             // --- Engine picker (same engines/parameters as file corruption) ---
             Text("Engine", style = MaterialTheme.typography.titleMedium)
             if (engines.isEmpty()) {
