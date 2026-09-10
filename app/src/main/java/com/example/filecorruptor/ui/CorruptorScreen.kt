@@ -45,6 +45,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Files bigger than this are assumed not worth even a cheap bounds-only
+ *  image-header probe — nothing a person would actually preview as a photo
+ *  is this large, and skipping the check entirely avoids any decode attempt
+ *  on huge ROM/ISO files. */
+private const val MAX_PREVIEWABLE_IMAGE_BYTES = 50_000_000L
+
 private data class PickedFile(
     val uri: Uri,
     val name: String,
@@ -78,6 +84,8 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
     var corrupted by remember { mutableStateOf<ByteArray?>(null) }
     var isProcessing by remember { mutableStateOf(false) }
     var savedMessage by remember { mutableStateOf<String?>(null) }
+    var pickLoading by remember { mutableStateOf(false) }
+    var pickError by remember { mutableStateOf<String?>(null) }
 
     // Holds the exact bytes a Save is writing, decoupled from the live
     // preview above — Save always computes a brand-new corruption right
@@ -120,14 +128,41 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: return@rememberLauncherForActivityResult
-        val name = queryDisplayName(context, uri) ?: "selected_file"
-        val isImage = runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null }.getOrDefault(false)
-        picked = PickedFile(uri, name, bytes, isImage)
-        corrupted = null
-        savedMessage = null
-        lastSavedUri = null // a new source file means a fresh save target
+        pickLoading = true
+        pickError = null
+        saveScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: error("Could not open that file")
+                    val name = queryDisplayName(context, uri) ?: "selected_file"
+                    // Bounds-only decode: this reads just the image header and
+                    // never allocates pixel data, so it's safe even on a
+                    // 600+MB file that isn't an image at all — unlike a full
+                    // decodeByteArray on the whole buffer, which is what was
+                    // actually crashing (BitmapFactory trying to interpret a
+                    // huge chunk of arbitrary ISO/ROM bytes as image pixels).
+                    // Anything bigger than a plausible image is skipped
+                    // entirely rather than even attempting that cheap decode.
+                    val isImage = bytes.size in 1..MAX_PREVIEWABLE_IMAGE_BYTES && runCatching {
+                        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                        opts.outWidth > 0 && opts.outHeight > 0
+                    }.getOrDefault(false)
+                    PickedFile(uri, name, bytes, isImage)
+                }
+            }
+            pickLoading = false
+            outcome.onSuccess { pf ->
+                picked = pf
+                corrupted = null
+                savedMessage = null
+                lastSavedUri = null // a new source file means a fresh save target
+            }.onFailure { e ->
+                pickError = "Couldn't open that file (${e.message ?: "out of memory"}). " +
+                    "Very large files need more headroom than this device's app memory limit allows."
+            }
+        }
     }
 
     val createDocumentLauncher = rememberLauncherForActivityResult(
@@ -205,11 +240,33 @@ fun CorruptorScreen(engineViewModel: EngineViewModel = viewModel()) {
         if (!batchMode) {
             FilledTonalButton(
                 onClick = { openDocumentLauncher.launch(arrayOf("*/*")) },
+                enabled = !pickLoading,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Filled.FolderOpen, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text(if (picked == null) "Select a file" else "Change file")
+            }
+            if (pickLoading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Text(
+                    "Reading file… large ROMs/ISOs can take a moment.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            pickError?.let {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                ) {
+                    Text(
+                        it,
+                        modifier = Modifier.padding(16.dp),
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
             }
         } else {
             FilledTonalButton(
