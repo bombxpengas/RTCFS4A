@@ -75,6 +75,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     var processes by remember { mutableStateOf<List<LiveProcess>>(emptyList()) }
     var processLoading by remember { mutableStateOf(false) }
     var selectedProcess by remember { mutableStateOf<LiveProcess?>(null) }
+    var processFilter by remember { mutableStateOf("") }
 
     var regions by remember { mutableStateOf<List<MemoryRegion>>(emptyList()) }
     var regionLoading by remember { mutableStateOf(false) }
@@ -247,15 +248,48 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
             if (processLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
 
             if (processes.isNotEmpty()) {
+                OutlinedTextField(
+                    value = processFilter,
+                    onValueChange = { processFilter = it },
+                    label = { Text("Filter by name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Same package before the ':' means Android spawned it as a
+                // separate process for the same app (a WebView renderer, an
+                // isolated service, an SDK's own process, etc.) — that's a
+                // real, distinct process with its own /proc/pid/maps, worth
+                // checking separately from the main one. This is genuinely
+                // different from a single process's map entries multiplying
+                // as it allocates more — this is checking whether an app
+                // that *looks* like one process actually spawned several.
+                val filtered = remember(processes, processFilter) {
+                    if (processFilter.isBlank()) processes
+                    else processes.filter { it.name.contains(processFilter, ignoreCase = true) }
+                }
+                val groupCounts = remember(processes) {
+                    processes.groupingBy { it.name.substringBefore(':') }.eachCount()
+                }
+
                 Card {
                     LazyColumn(Modifier.heightIn(max = 260.dp)) {
-                        items(processes) { p ->
+                        items(filtered) { p ->
+                            val base = p.name.substringBefore(':')
+                            val isChildProcess = p.name.contains(':')
+                            val siblingCount = groupCounts[base] ?: 1
                             ListItem(
                                 headlineContent = { Text(p.name, maxLines = 1) },
-                                supportingContent = { Text("pid ${p.pid}") },
+                                supportingContent = {
+                                    Text(
+                                        "pid ${p.pid}" +
+                                            if (isChildProcess) "  •  separate process of $base" else "",
+                                    )
+                                },
                                 trailingContent = {
-                                    if (selectedProcess?.pid == p.pid) {
-                                        Icon(Icons.Filled.Memory, contentDescription = "Selected")
+                                    when {
+                                        selectedProcess?.pid == p.pid -> Icon(Icons.Filled.Memory, contentDescription = "Selected")
+                                        siblingCount > 1 -> Text("${siblingCount}×", style = MaterialTheme.typography.labelMedium)
                                     }
                                 },
                                 modifier = Modifier.clickable {
