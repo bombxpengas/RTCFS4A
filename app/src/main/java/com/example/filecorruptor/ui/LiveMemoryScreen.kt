@@ -37,14 +37,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Generously covers PS1/N64/PSP/DS-sized console RAM while excluding most
- *  bloated ART/Dalvik heap spaces, which can easily run into the hundreds
- *  of MB on a modern device and are never what you actually want to poke. */
-private const val MAX_LIKELY_RAM_BYTES = 128L * 1024 * 1024
-
 /** Denylist of path substrings that mark a region as Android-runtime/system
- *  plumbing rather than anything belonging to the emulator's own game
- *  state — corrupting these just crashes the process almost every time. */
+ *  plumbing rather than anything belonging to the target app's own game
+ *  state — corrupting these just crashes the process almost every time.
+ *  This already catches ART/Dalvik heap spaces by their "dalvik" label
+ *  regardless of size, which used to also be covered by a separate hard
+ *  size cap on top of this — dropped, since it hid perfectly legitimate
+ *  large regions in apps with no fixed, known RAM size (a modern game
+ *  engine's world/chunk data, unlike a fixed-hardware console's RAM). */
 private val NOISY_PATH_MARKERS = listOf(
     "dalvik", "/apex/", "/system/", "/vendor/", ".so", ".dex", ".vdex", ".odex", ".oat", ".art",
     "/dev/", "[vdso]", "[vvar]", "[vsyscall]", "[stack", "jit-cache", "/data/dalvik-cache", "/linker"
@@ -296,22 +296,25 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
                 val visibleRegions = remember(regions, showAllRegions) {
                     if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
-                    else regions.filter { it.isWritable && it.size in 4096..MAX_LIKELY_RAM_BYTES && !looksLikeNoise(it) }
+                    else regions.filter { it.isWritable && it.size >= 4096 && !looksLikeNoise(it) }
                 }
 
                 if (regions.isNotEmpty()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = showAllRegions, onCheckedChange = { showAllRegions = it })
                         Text(
-                            "Show everything (including Dalvik/ART, system libs, and >128MB regions)",
+                            "Show everything (including Dalvik/ART and mapped system libraries)",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
                     Text(
                         "Hiding ${regions.size - visibleRegions.size} of ${regions.size} regions by default — " +
-                            "an emulator's own process also contains the Android runtime's Dalvik/ART heap " +
-                            "spaces, mapped system libraries, and other internals that aren't the emulated " +
-                            "console's RAM and will almost always just crash the target if corrupted.",
+                            "an app's own process also contains the Android runtime's Dalvik/ART heap spaces " +
+                            "and mapped system libraries, which aren't the app's own game state and will " +
+                            "almost always just crash the target if corrupted. Regions of any size are shown " +
+                            "now, though — a fixed-hardware console has one known RAM size to look for, but a " +
+                            "modern game engine's own memory (world/chunk data, asset caches) doesn't, so " +
+                            "filtering by size the way an emulator's console RAM can be doesn't apply here.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -319,11 +322,12 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
                 if (visibleRegions.isNotEmpty()) {
                     Text(
-                        "Pick the region whose size matches the console you're emulating — " +
-                            "e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
-                            "Unlabeled anonymous regions (marked below) are the best bet — a native " +
-                            "emulator core's own malloc'd RAM buffer usually shows up that way, with " +
-                            "no file path at all. There's no way to know for certain without trying it.",
+                        "For a fixed-hardware emulator, pick the region whose size matches the console's " +
+                            "own RAM — e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
+                            "For a modern game with no fixed RAM size (like Minecraft), that trick doesn't " +
+                            "apply — favor unlabeled anonymous regions instead (marked below), since a " +
+                            "native engine's own heap allocations usually show up that way with no file " +
+                            "path at all. Either way, there's no way to know for certain without trying it.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
