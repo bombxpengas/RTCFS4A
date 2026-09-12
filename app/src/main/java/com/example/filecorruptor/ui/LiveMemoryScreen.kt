@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Eco
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -55,6 +56,17 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
     val p = region.path.lowercase()
     return NOISY_PATH_MARKERS.any { marker -> p.contains(marker) }
 }
+
+/** Scudo is Android's own hardened malloc implementation (default since
+ *  Android 11), and it names its internal arenas via prctl — which is why
+ *  you see a readable "scudo:..." label instead of an anonymous blob.
+ *  Field-confirmed: a native app's actual heap-allocated game state (an
+ *  emulator's console-RAM buffer, for instance, is ultimately just a
+ *  malloc() call like anything else) tends to live in here alongside a lot
+ *  of other native heap allocations — a real step up from guessing blind,
+ *  even though it's still a shared arena, not a clean isolated buffer. */
+private fun looksRecommended(region: MemoryRegion): Boolean =
+    region.path.contains("scudo", ignoreCase = true)
 
 private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
 
@@ -356,12 +368,13 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         else regions.filter { it.isSafeToCorrupt && it.size >= 4096 && !looksLikeNoise(it) }
                     val pathMatched = if (regionPathFilter.isBlank()) filtered
                         else filtered.filter { it.path.contains(regionPathFilter, ignoreCase = true) }
-                    // New-since-last-scan regions float to the top — after a
-                    // re-scan (e.g. right after loading a ROM), whatever just
-                    // appeared is a much stronger candidate than sorting by
-                    // size alone ever was.
+                    // New-since-last-scan regions float to the top, then
+                    // Scudo-named ones (field-confirmed promising), then by
+                    // size within each tier.
                     pathMatched.sortedWith(
-                        compareByDescending<MemoryRegion> { isNewRegion(it) }.thenByDescending { it.size }
+                        compareByDescending<MemoryRegion> { isNewRegion(it) }
+                            .thenByDescending { looksRecommended(it) }
+                            .thenByDescending { it.size }
                     )
                 }
 
@@ -408,10 +421,19 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         "For a fixed-hardware emulator, pick the region whose size matches the console's " +
                             "own RAM — e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
                             "For a modern game with no fixed RAM size (like Minecraft), that trick doesn't " +
-                            "apply — favor unlabeled anonymous regions instead (marked below), since a " +
-                            "native engine's own heap allocations usually show up that way with no file " +
-                            "path at all. Tap a region to add or remove it from the target list below — " +
+                            "apply — favor unlabeled anonymous regions and ★ Scudo-labeled ones (marked " +
+                            "below) instead, since a native engine's own heap allocations tend to live in " +
+                            "one of those. Tap a region to add or remove it from the target list below — " +
                             "add several at once (even from a different process) to widen the net.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "If a region glitches the target before crashing it, that region is promising but " +
+                            "still shared with a lot of other live heap data — narrow the blast radius with " +
+                            "the engine's own Start Byte / End Byte (relative to the region, not the whole " +
+                            "process) and a much smaller Blast Count, then widen gradually from whatever " +
+                            "slice survives. That's how you turn \"glitches, then crashes\" into \"just glitches.\"",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -420,6 +442,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             items(visibleRegions) { region ->
                                 val isTargeted = targets.any { it.process.pid == proc.pid && it.region == region }
                                 val isNew = isNewRegion(region)
+                                val isRecommended = looksRecommended(region)
                                 ListItem(
                                     headlineContent = { Text(formatSize(region.size)) },
                                     supportingContent = {
@@ -429,12 +452,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         )
                                     },
                                     leadingContent = {
-                                        if (isNew) {
-                                            Icon(
-                                                Icons.Filled.Eco,
-                                                contentDescription = "New since last scan",
-                                                tint = MaterialTheme.colorScheme.primary
-                                            )
+                                        if (isNew || isRecommended) {
+                                            Row {
+                                                if (isNew) {
+                                                    Icon(
+                                                        Icons.Filled.Eco,
+                                                        contentDescription = "New since last scan",
+                                                        tint = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                                if (isRecommended) {
+                                                    Icon(
+                                                        Icons.Filled.Star,
+                                                        contentDescription = "Recommended (Scudo heap arena)",
+                                                        tint = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                            }
                                         }
                                     },
                                     trailingContent = {
