@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Eco
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
@@ -55,6 +56,8 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
     return NOISY_PATH_MARKERS.any { marker -> p.contains(marker) }
 }
 
+private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
+
 private fun formatSize(bytes: Long): String = when {
     bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
     bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
@@ -79,11 +82,21 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
     var regions by remember { mutableStateOf<List<MemoryRegion>>(emptyList()) }
     var regionLoading by remember { mutableStateOf(false) }
-    var selectedRegion by remember { mutableStateOf<MemoryRegion?>(null) }
+    // Tracks the previous scan's results so a re-scan can flag regions that
+    // weren't there before — e.g. scan, load a ROM, scan again, and whatever
+    // just appeared is a strong candidate for the console RAM the emulator
+    // only just allocated. scanCount starts fresh whenever you switch process,
+    // since comparing across two different processes' scans is meaningless.
+    var previousRegions by remember { mutableStateOf<Set<MemoryRegion>>(emptySet()) }
+    var scanCount by remember { mutableStateOf(0) }
+
+    // Accumulated across possibly several processes — pick a process, scan
+    // it, add one or more regions, then switch process and add more. Every
+    // added target gets corrupted together each cycle.
+    var targets by remember { mutableStateOf<List<CorruptionTarget>>(emptyList()) }
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
-    var lastCycleError by remember { mutableStateOf<String?>(null) }
     var isErrorStatus by remember { mutableStateOf(false) }
 
     var liveRunning by remember { mutableStateOf(false) }
@@ -295,7 +308,12 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                 modifier = Modifier.clickable {
                                     selectedProcess = p
                                     regions = emptyList()
-                                    selectedRegion = null
+                                    previousRegions = emptySet()
+                                    scanCount = 0
+                                    // targets deliberately NOT cleared here —
+                                    // switching process is how you add a
+                                    // second process's region to the same
+                                    // multi-target corruption set.
                                 }
                             )
                             HorizontalDivider()
@@ -315,7 +333,9 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         regionLoading = true
                         scope.launch {
                             val all = withContext(Dispatchers.IO) { RootMemoryHelper.listMemoryMaps(context, proc.pid) }
-                            regions = all.sortedByDescending { it.size }
+                            previousRegions = regions.toSet() // snapshot before overwriting, for the "new" comparison below
+                            regions = all
+                            scanCount++
                             regionLoading = false
                         }
                     },
@@ -324,13 +344,22 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 ) {
                     Icon(Icons.Filled.Memory, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Scan memory regions")
+                    Text(if (scanCount == 0) "Scan memory regions" else "Re-scan (highlight new regions)")
                 }
                 if (regionLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
 
-                val visibleRegions = remember(regions, showAllRegions) {
-                    if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
-                    else regions.filter { it.isWritable && it.size >= 4096 && !looksLikeNoise(it) }
+                val isNewRegion: (MemoryRegion) -> Boolean = { scanCount > 1 && it !in previousRegions }
+
+                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount) {
+                    val filtered = if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
+                        else regions.filter { it.isWritable && it.size >= 4096 && !looksLikeNoise(it) }
+                    // New-since-last-scan regions float to the top — after a
+                    // re-scan (e.g. right after loading a ROM), whatever just
+                    // appeared is a much stronger candidate than sorting by
+                    // size alone ever was.
+                    filtered.sortedWith(
+                        compareByDescending<MemoryRegion> { isNewRegion(it) }.thenByDescending { it.size }
+                    )
                 }
 
                 if (regions.isNotEmpty()) {
@@ -352,6 +381,15 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (scanCount > 1) {
+                        Text(
+                            "🌱 marks regions that appeared since your last scan of this process — e.g. " +
+                                "scan once, load a ROM in the emulator, then re-scan: whatever's newly " +
+                                "marked is very likely the RAM that just got allocated for it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
 
                 if (visibleRegions.isNotEmpty()) {
@@ -361,13 +399,16 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             "For a modern game with no fixed RAM size (like Minecraft), that trick doesn't " +
                             "apply — favor unlabeled anonymous regions instead (marked below), since a " +
                             "native engine's own heap allocations usually show up that way with no file " +
-                            "path at all. Either way, there's no way to know for certain without trying it.",
+                            "path at all. Tap a region to add or remove it from the target list below — " +
+                            "add several at once (even from a different process) to widen the net.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Card {
                         LazyColumn(Modifier.heightIn(max = 320.dp)) {
                             items(visibleRegions) { region ->
+                                val isTargeted = targets.any { it.process.pid == proc.pid && it.region == region }
+                                val isNew = isNewRegion(region)
                                 ListItem(
                                     headlineContent = { Text(formatSize(region.size)) },
                                     supportingContent = {
@@ -376,12 +417,27 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                 if (region.path.isNotBlank()) "  ${region.path}" else "  [anonymous — likely candidate]"
                                         )
                                     },
-                                    trailingContent = {
-                                        if (selectedRegion == region) {
-                                            Icon(Icons.Filled.Memory, contentDescription = "Selected")
+                                    leadingContent = {
+                                        if (isNew) {
+                                            Icon(
+                                                Icons.Filled.Eco,
+                                                contentDescription = "New since last scan",
+                                                tint = MaterialTheme.colorScheme.primary
+                                            )
                                         }
                                     },
-                                    modifier = Modifier.clickable { selectedRegion = region }
+                                    trailingContent = {
+                                        if (isTargeted) {
+                                            Icon(Icons.Filled.Memory, contentDescription = "Targeted")
+                                        }
+                                    },
+                                    modifier = Modifier.clickable {
+                                        targets = if (isTargeted) {
+                                            targets.filterNot { it.process.pid == proc.pid && it.region == region }
+                                        } else {
+                                            targets + CorruptionTarget(proc, region)
+                                        }
+                                    }
                                 )
                                 HorizontalDivider()
                             }
@@ -390,9 +446,25 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
             }
 
+            if (targets.isNotEmpty()) {
+                Text("Targets (${targets.size})", style = MaterialTheme.typography.titleMedium)
+                Card {
+                    Column(Modifier.padding(8.dp)) {
+                        targets.forEach { t ->
+                            ListItem(
+                                headlineContent = { Text("${t.process.name} — ${formatSize(t.region.size)}", maxLines = 1) },
+                                supportingContent = { Text("pid ${t.process.pid} @ 0x${t.region.start.toString(16)}") },
+                                trailingContent = {
+                                    TextButton(onClick = { targets = targets - t }) { Text("Remove") }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
             // --- Parameters + corruption controls ---
-            val region = selectedRegion
-            if (engine != null && region != null) {
+            if (engine != null && targets.isNotEmpty()) {
                 val engineValues = engineViewModel.valuesFor(engine.id)
                 val currentValues = engineValues.toMap()
 
@@ -411,52 +483,62 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     }
                 }
 
-                fun runOneCycle(onDone: (Boolean) -> Unit) {
-                    val proc = selectedProcess
-                    if (proc == null) {
-                        onDone(false)
-                        return
+                // One target's failure (OOM on a huge region, process exited,
+                // etc.) never stops the others — each is fully independent,
+                // same as batch file corruption tallies successes/failures
+                // instead of aborting the whole run on the first problem.
+                suspend fun corruptOneTarget(target: CorruptionTarget, values: Map<String, ParamValue>): Result<Long> =
+                    runCatching {
+                        val bytes = RootMemoryHelper.readMemory(context, target.process.pid, target.region.start, target.region.size.toInt())
+                            ?: error("could not read ${target.process.name}'s region — it may have moved or the process may be gone")
+                        val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, values)
+                        if (!RootMemoryHelper.writeMemory(context, target.process.pid, target.region.start, result.bytes)) {
+                            error("write failed for ${target.process.name}")
+                        }
+                        result.seedUsed
                     }
+
+                fun runOneCycle(onDone: (succeeded: Int, failed: Int, lastError: String?) -> Unit) {
+                    val currentTargets = targets
                     scope.launch {
-                        val outcome = withContext(Dispatchers.IO) {
-                            // Catches Throwable on purpose, not just Exception —
-                            // a very large region (an ART/Dalvik heap someone
-                            // picked via "Show everything") can throw
-                            // OutOfMemoryError here, since this cycle briefly
-                            // holds the region's bytes twice (original +
-                            // corrupted). That used to crash the whole app;
-                            // now it's just a failed attempt with a clear reason.
-                            runCatching {
-                                val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
-                                    ?: error("could not read that region — it may have moved or the process may be gone")
-                                val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, currentValues)
-                                if (engineValues.containsKey("lastSeedUsed")) {
-                                    engineValues["lastSeedUsed"] = ParamValue.of(result.seedUsed.toString())
-                                }
-                                if (!RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)) {
-                                    error("write failed")
-                                }
+                        var succeeded = 0
+                        var failed = 0
+                        var lastError: String? = null
+                        var lastSeed: Long? = null
+                        withContext(Dispatchers.IO) {
+                            for (target in currentTargets) {
+                                corruptOneTarget(target, currentValues)
+                                    .onSuccess { seed -> succeeded++; lastSeed = seed }
+                                    .onFailure { e ->
+                                        failed++
+                                        lastError = if (e is OutOfMemoryError) {
+                                            "Out of memory on ${target.process.name} (${formatSize(target.region.size)}) — too large to hold twice at once."
+                                        } else {
+                                            e.message
+                                        }
+                                    }
                             }
                         }
-                        lastCycleError = outcome.exceptionOrNull()?.let { e ->
-                            if (e is OutOfMemoryError) {
-                                "Out of memory — ${formatSize(region.size)} is too large for this device to hold twice at once. Try a smaller region."
-                            } else {
-                                e.message ?: "Unknown error"
+                        lastSeed?.let { seed ->
+                            if (engineValues.containsKey("lastSeedUsed")) {
+                                engineValues["lastSeedUsed"] = ParamValue.of(seed.toString())
                             }
                         }
-                        onDone(outcome.isSuccess)
+                        onDone(succeeded, failed, lastError)
                     }
                 }
 
                 Button(
                     onClick = {
                         isBusy = true
-                        runOneCycle { ok ->
+                        runOneCycle { succeeded, failed, lastError ->
                             isBusy = false
-                            isErrorStatus = !ok
-                            statusMessage = if (ok) "Corrupted ${formatSize(region.size)} once."
-                            else lastCycleError ?: "Read/write failed — process may have exited or region is no longer valid."
+                            isErrorStatus = failed > 0
+                            statusMessage = when {
+                                failed == 0 -> "Corrupted all $succeeded target(s) once."
+                                succeeded == 0 -> lastError ?: "All $failed target(s) failed."
+                                else -> "Corrupted $succeeded, failed $failed" + (lastError?.let { " — $it" } ?: "")
+                            }
                         }
                     },
                     enabled = !isBusy && !liveRunning,
@@ -464,7 +546,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 ) {
                     Icon(Icons.Filled.Bolt, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Corrupt Once")
+                    Text("Corrupt Once (${targets.size} target${if (targets.size == 1) "" else "s"})")
                 }
 
                 HorizontalDivider()
@@ -477,7 +559,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     Column(Modifier.weight(1f)) {
                         Text("Live Corrupting", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
                         Text(
-                            "Repeatedly re-corrupts this region until you turn it off.",
+                            "Repeatedly re-corrupts every target until you turn it off.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -506,35 +588,36 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
 
                 if (liveRunning) {
-                    LaunchedEffect(liveRunning, region, engine.id, tickIntervalMs) {
+                    LaunchedEffect(liveRunning, targets, engine.id, tickIntervalMs) {
                         while (liveRunning) {
-                            val proc = selectedProcess
-                            if (proc == null) {
+                            if (targets.isEmpty()) {
                                 liveRunning = false
                                 break
                             }
-                            val outcome = withContext(Dispatchers.IO) {
-                                // Same OOM-safety reasoning as Corrupt Once —
-                                // a bad region choice must stop the loop
-                                // cleanly, not crash the app mid-loop.
-                                runCatching {
-                                    val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, region.size.toInt())
-                                        ?: error("could not read that region")
-                                    val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, engineValues.toMap())
-                                    if (!RootMemoryHelper.writeMemory(context, proc.pid, region.start, result.bytes)) {
-                                        error("write failed")
-                                    }
+                            var anySucceeded = false
+                            var anyFailed = false
+                            var lastError: String? = null
+                            withContext(Dispatchers.IO) {
+                                for (target in targets) {
+                                    // Same OOM-safety reasoning as Corrupt Once —
+                                    // one bad target must not crash the loop or
+                                    // stop the other targets from still ticking.
+                                    corruptOneTarget(target, engineValues.toMap())
+                                        .onSuccess { anySucceeded = true }
+                                        .onFailure { e ->
+                                            anyFailed = true
+                                            lastError = if (e is OutOfMemoryError) {
+                                                "out of memory on ${target.process.name} (${formatSize(target.region.size)})"
+                                            } else {
+                                                e.message
+                                            }
+                                        }
                                 }
                             }
-                            if (outcome.isFailure) {
+                            if (!anySucceeded && anyFailed) {
                                 liveRunning = false
                                 isErrorStatus = true
-                                val e = outcome.exceptionOrNull()
-                                statusMessage = when {
-                                    e is OutOfMemoryError ->
-                                        "Live corrupting stopped — out of memory. ${formatSize(region.size)} is too large for this device to hold twice at once."
-                                    else -> "Live corrupting stopped — the process may have exited, or the region is no longer valid."
-                                }
+                                statusMessage = "Live corrupting stopped — $lastError"
                                 break
                             }
                             tickCount++
