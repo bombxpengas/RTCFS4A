@@ -348,16 +348,19 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
                 if (regionLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
 
+                var regionPathFilter by remember { mutableStateOf("") }
                 val isNewRegion: (MemoryRegion) -> Boolean = { scanCount > 1 && it !in previousRegions }
 
-                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount) {
+                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount, regionPathFilter) {
                     val filtered = if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
-                        else regions.filter { it.isWritable && it.size >= 4096 && !looksLikeNoise(it) }
+                        else regions.filter { it.isSafeToCorrupt && it.size >= 4096 && !looksLikeNoise(it) }
+                    val pathMatched = if (regionPathFilter.isBlank()) filtered
+                        else filtered.filter { it.path.contains(regionPathFilter, ignoreCase = true) }
                     // New-since-last-scan regions float to the top — after a
                     // re-scan (e.g. right after loading a ROM), whatever just
                     // appeared is a much stronger candidate than sorting by
                     // size alone ever was.
-                    filtered.sortedWith(
+                    pathMatched.sortedWith(
                         compareByDescending<MemoryRegion> { isNewRegion(it) }.thenByDescending { it.size }
                     )
                 }
@@ -366,18 +369,26 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = showAllRegions, onCheckedChange = { showAllRegions = it })
                         Text(
-                            "Show everything (including Dalvik/ART and mapped system libraries)",
+                            "Show everything (including executable, Dalvik/ART, and system library regions)",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
+                    OutlinedTextField(
+                        value = regionPathFilter,
+                        onValueChange = { regionPathFilter = it },
+                        label = { Text("Filter by mapped file/library name (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     Text(
                         "Hiding ${regions.size - visibleRegions.size} of ${regions.size} regions by default — " +
-                            "an app's own process also contains the Android runtime's Dalvik/ART heap spaces " +
-                            "and mapped system libraries, which aren't the app's own game state and will " +
-                            "almost always just crash the target if corrupted. Regions of any size are shown " +
-                            "now, though — a fixed-hardware console has one known RAM size to look for, but a " +
-                            "modern game engine's own memory (world/chunk data, asset caches) doesn't, so " +
-                            "filtering by size the way an emulator's console RAM can be doesn't apply here.",
+                            "besides Dalvik/ART heap spaces and mapped system libraries, this now also excludes " +
+                            "executable (rwx) regions, matching what RTCV's own real process-corruption mode " +
+                            "does by default: an executable page is far more likely to be JIT-compiled code or " +
+                            "similar machinery than plain game data, and corrupting it tends to just crash the " +
+                            "process outright rather than glitch it. Regions of any size are shown, though — a " +
+                            "fixed-hardware console has one known RAM size to look for, but a modern game " +
+                            "engine's own memory (world/chunk data, asset caches) doesn't.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

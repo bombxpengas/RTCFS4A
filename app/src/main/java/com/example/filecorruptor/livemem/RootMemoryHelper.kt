@@ -10,6 +10,21 @@ data class LiveProcess(val pid: Int, val name: String)
 data class MemoryRegion(val start: Long, val end: Long, val perms: String, val path: String) {
     val size: Long get() = end - start
     val isWritable: Boolean get() = perms.length >= 2 && perms[0] == 'r' && perms[1] == 'w'
+
+    /**
+     * Matches the real RTCV's own default targeting rule for a raw,
+     * non-cooperative process (see RTCV.ProcessCorrupt.ProcessWatch.
+     * GetInterfaces: `(mbi.Protect | ProtectMode) == ProtectMode` with
+     * ProtectMode defaulting to plain PAGE_READWRITE alone) — read+write
+     * is required, but executable pages are explicitly excluded. An
+     * executable region is far more likely to be JIT-compiled code, a
+     * trampoline, or similar structural machinery than plain game data,
+     * and corrupting it tends to produce an instant crash (jumping into
+     * garbage instructions) rather than a glitch. Our previous filter
+     * only checked for 'rw' and let 'rwx' regions through unfiltered.
+     */
+    val isSafeToCorrupt: Boolean get() =
+        perms.length >= 3 && perms[0] == 'r' && perms[1] == 'w' && perms[2] != 'x'
 }
 
 /**
