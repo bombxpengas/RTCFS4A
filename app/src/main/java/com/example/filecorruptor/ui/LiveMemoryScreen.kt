@@ -46,9 +46,21 @@ import kotlinx.coroutines.withContext
  *  regardless of size, which used to also be covered by a separate hard
  *  size cap on top of this — dropped, since it hid perfectly legitimate
  *  large regions in apps with no fixed, known RAM size (a modern game
- *  engine's world/chunk data, unlike a fixed-hardware console's RAM). */
+ *  engine's world/chunk data, unlike a fixed-hardware console's RAM).
+ *
+ *  NOTE: ".so" is deliberately NOT in this list, even though it used to
+ *  be. Source-confirmed with FCEUmm (the NES core Lemuroid uses): a
+ *  loaded library maps as two separate regions — an executable r-xp code
+ *  segment (still excluded, by isSafeToCorrupt's non-executable check
+ *  below) and a much smaller, non-executable rw-p data/bss segment,
+ *  which is exactly where a core's static globals live — FCEUmm's real
+ *  NES RAM, nametable RAM, and palette RAM are literal top-level C
+ *  arrays (uint8_t RAM[0x800], NTARAM[0x800], PALRAM[0x20], ...), not
+ *  malloc'd heap buffers, so they physically live inside the .so's own
+ *  mapping. Blanket-excluding every ".so" path was hiding exactly the
+ *  region that mattered for a core built this way. */
 private val NOISY_PATH_MARKERS = listOf(
-    "dalvik", "/apex/", "/system/", "/vendor/", ".so", ".dex", ".vdex", ".odex", ".oat", ".art",
+    "dalvik", "/apex/", "/system/", "/vendor/", ".dex", ".vdex", ".odex", ".oat", ".art",
     "/dev/", "[vdso]", "[vvar]", "[vsyscall]", "[stack", "jit-cache", "/data/dalvik-cache", "/linker"
 )
 
@@ -65,8 +77,30 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
  *  malloc() call like anything else) tends to live in here alongside a lot
  *  of other native heap allocations — a real step up from guessing blind,
  *  even though it's still a shared arena, not a clean isolated buffer. */
+/** Field- and source-confirmed good candidates get a ★:
+ *  - Scudo (Android's own hardened malloc) arenas — see comment above.
+ *  - A loaded library's own writable, non-executable segment — this is
+ *    where FCEUmm keeps RAM/NTARAM/PALRAM as plain static arrays, and any
+ *    core built the same way (an older, C-style codebase with fixed-size
+ *    console memory as top-level globals rather than malloc'd) will keep
+ *    its own state there too. isSafeToCorrupt already guarantees this
+ *    isn't the dangerous executable code segment of the same library. */
 private fun looksRecommended(region: MemoryRegion): Boolean =
-    region.path.contains("scudo", ignoreCase = true)
+    region.path.contains("scudo", ignoreCase = true) ||
+    (region.path.contains(".so", ignoreCase = true) && region.isSafeToCorrupt)
+
+/** Source-confirmed with Lemuroid: it declares android:process=":game" on its
+ *  GameActivity specifically so a crashing libretro core takes down only
+ *  that process, not the whole app — the real emulation core and its RAM
+ *  live there, not in the main package process. Generalized to other
+ *  common naming conventions other emulator/game frontends use for the
+ *  same isolation pattern, since this isn't a Lemuroid-only trick. */
+private val LIKELY_EMULATION_PROCESS_SUFFIXES = listOf("game", "emu", "emulator", "core", "libretro")
+
+private fun looksLikeEmulationProcess(processName: String): Boolean {
+    val suffix = processName.substringAfter(':', missingDelimiterValue = "").lowercase()
+    return suffix.isNotEmpty() && LIKELY_EMULATION_PROCESS_SUFFIXES.any { suffix.contains(it) }
+}
 
 private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
 
@@ -290,8 +324,13 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 // as it allocates more — this is checking whether an app
                 // that *looks* like one process actually spawned several.
                 val filtered = remember(processes, processFilter) {
-                    if (processFilter.isBlank()) processes
-                    else processes.filter { it.name.contains(processFilter, ignoreCase = true) }
+                    val matched = if (processFilter.isBlank()) processes
+                        else processes.filter { it.name.contains(processFilter, ignoreCase = true) }
+                    // Likely emulation-core child processes (":game", ":emu",
+                    // etc.) float to the top — source-confirmed with Lemuroid
+                    // that this is genuinely where the interesting memory is,
+                    // not the main package process most people would guess.
+                    matched.sortedByDescending { looksLikeEmulationProcess(it.name) }
                 }
                 val groupCounts = remember(processes) {
                     processes.groupingBy { it.name.substringBefore(':') }.eachCount()
@@ -303,13 +342,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             val base = p.name.substringBefore(':')
                             val isChildProcess = p.name.contains(':')
                             val siblingCount = groupCounts[base] ?: 1
+                            val looksLikeEmuCore = isChildProcess && looksLikeEmulationProcess(p.name)
                             ListItem(
                                 headlineContent = { Text(p.name, maxLines = 1) },
                                 supportingContent = {
                                     Text(
                                         "pid ${p.pid}" +
-                                            if (isChildProcess) "  •  separate process of $base" else "",
+                                            when {
+                                                looksLikeEmuCore -> "  •  likely holds the actual emulation core (isolated from $base)"
+                                                isChildProcess -> "  •  separate process of $base"
+                                                else -> ""
+                                            },
                                     )
+                                },
+                                leadingContent = {
+                                    if (looksLikeEmuCore) {
+                                        Icon(Icons.Filled.Star, contentDescription = "Likely emulation core process", tint = MaterialTheme.colorScheme.primary)
+                                    }
                                 },
                                 trailingContent = {
                                     when {
@@ -421,10 +470,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         "For a fixed-hardware emulator, pick the region whose size matches the console's " +
                             "own RAM — e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
                             "For a modern game with no fixed RAM size (like Minecraft), that trick doesn't " +
-                            "apply — favor unlabeled anonymous regions and ★ Scudo-labeled ones (marked " +
-                            "below) instead, since a native engine's own heap allocations tend to live in " +
-                            "one of those. Tap a region to add or remove it from the target list below — " +
-                            "add several at once (even from a different process) to widen the net.",
+                            "apply — favor unlabeled anonymous regions and ★-marked ones instead, since a " +
+                            "native engine's own memory tends to live in one of those. A ★ on a region " +
+                            "belonging to a loaded .so is its writable, non-executable data segment — some " +
+                            "emulator cores (FCEUmm's NES core, for one) keep their entire console RAM as " +
+                            "plain static arrays there rather than a separate heap buffer, so it's worth " +
+                            "checking even though it's technically part of a library file. Tap a region to " +
+                            "add or remove it from the target list below — add several at once (even from a " +
+                            "different process) to widen the net.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
