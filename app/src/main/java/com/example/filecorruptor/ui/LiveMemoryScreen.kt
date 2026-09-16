@@ -15,6 +15,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Eco
+import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
@@ -102,6 +103,79 @@ private fun looksLikeEmulationProcess(processName: String): Boolean {
     return suffix.isNotEmpty() && LIKELY_EMULATION_PROCESS_SUFFIXES.any { suffix.contains(it) }
 }
 
+/** A contiguous-ish (small gaps allowed) span of a region where bytes were
+ *  observed to actually change value across repeated samples — a real,
+ *  measured signal instead of guessing by region label or size. [changeScore]
+ *  is the total number of byte-level changes observed within the window,
+ *  summed across all sampled offsets in it (not just a count of offsets). */
+private data class HotWindow(val offsetStart: Int, val offsetEnd: Int, val changeScore: Int) {
+    val size: Int get() = offsetEnd - offsetStart
+}
+
+/**
+ * Reads [region] repeatedly (with a short delay between reads, so real
+ * gameplay has a chance to actually change something), then diffs
+ * consecutive samples byte-by-byte to find which offsets are genuinely
+ * "live" — this is the same fundamental idea behind a GameGuardian-style
+ * "unknown initial value, search by what changed" scan, just applied
+ * automatically across a whole region instead of one address at a time.
+ * Nearby changed bytes get grouped into windows (allowing small gaps) so
+ * the result is a short, rankable list instead of a raw per-byte dump.
+ */
+private suspend fun analyzeRegionActivity(
+    context: android.content.Context,
+    pid: Int,
+    region: MemoryRegion,
+    samples: Int,
+    intervalMs: Long,
+    onProgress: (done: Int, total: Int) -> Unit
+): List<HotWindow> {
+    val size = region.size.toInt()
+    if (size <= 0) return emptyList()
+
+    val snapshots = ArrayList<ByteArray>(samples)
+    repeat(samples) { i ->
+        val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size)
+        if (bytes != null) snapshots.add(bytes)
+        onProgress(i + 1, samples)
+        if (i < samples - 1) delay(intervalMs)
+    }
+    if (snapshots.size < 2) return emptyList()
+
+    val changeCounts = IntArray(size)
+    for (i in 1 until snapshots.size) {
+        val prev = snapshots[i - 1]
+        val curr = snapshots[i]
+        for (j in 0 until size) {
+            if (prev[j] != curr[j]) changeCounts[j]++
+        }
+    }
+
+    val maxGapBytes = 16
+    val windows = mutableListOf<HotWindow>()
+    var i = 0
+    while (i < size) {
+        if (changeCounts[i] > 0) {
+            val windowStart = i
+            var lastActive = i
+            var score = changeCounts[i]
+            var j = i + 1
+            while (j < size && (j - lastActive) <= maxGapBytes) {
+                if (changeCounts[j] > 0) {
+                    score += changeCounts[j]
+                    lastActive = j
+                }
+                j++
+            }
+            windows.add(HotWindow(windowStart, lastActive + 1, score))
+            i = lastActive + 1
+        } else {
+            i++
+        }
+    }
+    return windows.sortedByDescending { it.changeScore }.take(25)
+}
+
 private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
 
 private fun formatSize(bytes: Long): String = when {
@@ -140,6 +214,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     // it, add one or more regions, then switch process and add more. Every
     // added target gets corrupted together each cycle.
     var targets by remember { mutableStateOf<List<CorruptionTarget>>(emptyList()) }
+
+    // Activity-scan state: which (process, region) is currently being
+    // analyzed, its progress, sample count, and the resulting hot windows.
+    var analysisTarget by remember { mutableStateOf<CorruptionTarget?>(null) }
+    var analysisRunning by remember { mutableStateOf(false) }
+    var analysisProgress by remember { mutableStateOf(0 to 0) }
+    var analysisSamples by remember { mutableStateOf(8f) }
+    var hotWindows by remember { mutableStateOf<List<HotWindow>>(emptyList()) }
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
@@ -525,8 +607,32 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         }
                                     },
                                     trailingContent = {
-                                        if (isTargeted) {
-                                            Icon(Icons.Filled.Memory, contentDescription = "Targeted")
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            if (isTargeted) {
+                                                Icon(Icons.Filled.Memory, contentDescription = "Targeted")
+                                            }
+                                            IconButton(
+                                                onClick = {
+                                                    val target = CorruptionTarget(proc, region)
+                                                    analysisTarget = target
+                                                    hotWindows = emptyList()
+                                                    analysisRunning = true
+                                                    scope.launch {
+                                                        val result = withContext(Dispatchers.IO) {
+                                                            analyzeRegionActivity(
+                                                                context, proc.pid, region,
+                                                                samples = analysisSamples.toInt().coerceAtLeast(2),
+                                                                intervalMs = 150L
+                                                            ) { done, total -> analysisProgress = done to total }
+                                                        }
+                                                        hotWindows = result
+                                                        analysisRunning = false
+                                                    }
+                                                },
+                                                enabled = !analysisRunning
+                                            ) {
+                                                Icon(Icons.Filled.Insights, contentDescription = "Analyze activity in this region")
+                                            }
                                         }
                                     },
                                     modifier = Modifier.clickable {
@@ -538,6 +644,85 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                     }
                                 )
                                 HorizontalDivider()
+                            }
+                        }
+                    }
+                }
+
+                Column {
+                    Text(
+                        "Activity scan samples: ${analysisSamples.toInt()}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Slider(
+                        value = analysisSamples,
+                        onValueChange = { analysisSamples = it },
+                        valueRange = 4f..20f,
+                        steps = 15,
+                        enabled = !analysisRunning
+                    )
+                    Text(
+                        "Tap the 🔍 next to a region to sample it repeatedly and find bytes that are " +
+                            "actually changing — a real measurement instead of a guess. Do this while " +
+                            "something is happening in the target (moving, taking damage, a HUD counter " +
+                            "ticking) so there's something to detect. More samples take longer but catch " +
+                            "slower-changing state too.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                if (analysisRunning) {
+                    val (done, total) = analysisProgress
+                    LinearProgressIndicator(
+                        progress = { if (total == 0) 0f else done / total.toFloat() },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Sampling ${analysisTarget?.region?.let { formatSize(it.size) } ?: ""}… ($done/$total)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                if (!analysisRunning && analysisTarget != null) {
+                    val target = analysisTarget!!
+                    Text("Activity in ${formatSize(target.region.size)} region", style = MaterialTheme.typography.titleMedium)
+                    if (hotWindows.isEmpty()) {
+                        Text(
+                            "Nothing changed across the sampled window. Either nothing was happening in " +
+                                "the target during the scan, or this region really is static — try again " +
+                                "while something is actively occurring, or pick a different region.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Card {
+                            Column(Modifier.padding(8.dp)) {
+                                hotWindows.forEach { w ->
+                                    ListItem(
+                                        headlineContent = {
+                                            Text("0x${w.offsetStart.toString(16)} - 0x${w.offsetEnd.toString(16)}  (${w.size} bytes)")
+                                        },
+                                        supportingContent = { Text("Changed ${w.changeScore} time(s) across the samples") },
+                                        trailingContent = {
+                                            TextButton(onClick = {
+                                                if (targets.none { it.process.pid == target.process.pid && it.region == target.region }) {
+                                                    targets = targets + target
+                                                }
+                                                val eng = engine
+                                                if (eng != null) {
+                                                    val values = engineViewModel.valuesFor(eng.id)
+                                                    if (values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
+                                                        values["rangeStart"] = ParamValue.of(w.offsetStart.toString())
+                                                        values["rangeEnd"] = ParamValue.of(w.offsetEnd.toString())
+                                                    }
+                                                }
+                                            }) { Text("Use range") }
+                                        }
+                                    )
+                                }
                             }
                         }
                     }

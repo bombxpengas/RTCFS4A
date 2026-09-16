@@ -21,8 +21,17 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest runners already ship with the Android SDK, cmdline-tools,
+      # and sdkmanager preinstalled (ANDROID_HOME is set out of the box) — no
+      # third-party action needed to "set it up". Switched away from
+      # android-actions/setup-android@v3 because it fails outright now: it
+      # tries to install the legacy "tools" package, which Google removed
+      # from the SDK repository server-side a while back, so sdkmanager exits
+      # non-zero regardless of which version of that action you pin.
+      - name: Add Android SDK cmdline-tools to PATH
+        run: |
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses > /dev/null || true
