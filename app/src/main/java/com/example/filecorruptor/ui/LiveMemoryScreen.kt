@@ -70,14 +70,6 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
     return NOISY_PATH_MARKERS.any { marker -> p.contains(marker) }
 }
 
-/** Scudo is Android's own hardened malloc implementation (default since
- *  Android 11), and it names its internal arenas via prctl — which is why
- *  you see a readable "scudo:..." label instead of an anonymous blob.
- *  Field-confirmed: a native app's actual heap-allocated game state (an
- *  emulator's console-RAM buffer, for instance, is ultimately just a
- *  malloc() call like anything else) tends to live in here alongside a lot
- *  of other native heap allocations — a real step up from guessing blind,
- *  even though it's still a shared arena, not a clean isolated buffer. */
 /** Field- and source-confirmed good candidates get a ★:
  *  - Scudo (Android's own hardened malloc) arenas — see comment above.
  *  - A loaded library's own writable, non-executable segment — this is
@@ -112,40 +104,23 @@ private data class HotWindow(val offsetStart: Int, val offsetEnd: Int, val chang
     val size: Int get() = offsetEnd - offsetStart
 }
 
-/**
- * Reads [region] repeatedly (with a short delay between reads, so real
- * gameplay has a chance to actually change something), then diffs
- * consecutive samples byte-by-byte to find which offsets are genuinely
- * "live" — this is the same fundamental idea behind a GameGuardian-style
- * "unknown initial value, search by what changed" scan, just applied
- * automatically across a whole region instead of one address at a time.
- * Nearby changed bytes get grouped into windows (allowing small gaps) so
- * the result is a short, rankable list instead of a raw per-byte dump.
- */
-private suspend fun analyzeRegionActivity(
-    context: android.content.Context,
-    pid: Int,
-    region: MemoryRegion,
-    samples: Int,
-    intervalMs: Long,
-    onProgress: (done: Int, total: Int) -> Unit
-): List<HotWindow> {
-    val size = region.size.toInt()
-    if (size <= 0) return emptyList()
+/** Result of analyzing one region: its hot windows (ranked) and the total
+ *  activity score across the whole region — the latter is what lets
+ *  regions be ranked against *each other*, not just windows within one. */
+private data class RegionActivity(val windows: List<HotWindow>, val totalScore: Int)
 
-    val snapshots = ArrayList<ByteArray>(samples)
-    repeat(samples) { i ->
-        val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size)
-        if (bytes != null) snapshots.add(bytes)
-        onProgress(i + 1, samples)
-        if (i < samples - 1) delay(intervalMs)
-    }
-    if (snapshots.size < 2) return emptyList()
+/** Shared by both the single-region and batch analyzers: diffs consecutive
+ *  snapshots byte-by-byte, then clusters nearby changed offsets (small gaps
+ *  tolerated) into a short, rankable list of windows instead of a raw
+ *  per-byte dump. */
+private fun computeRegionActivity(snapshots: List<ByteArray>, size: Int): RegionActivity {
+    if (snapshots.size < 2 || size <= 0) return RegionActivity(emptyList(), 0)
 
     val changeCounts = IntArray(size)
     for (i in 1 until snapshots.size) {
         val prev = snapshots[i - 1]
         val curr = snapshots[i]
+        if (prev.size != size || curr.size != size) continue
         for (j in 0 until size) {
             if (prev[j] != curr[j]) changeCounts[j]++
         }
@@ -173,7 +148,72 @@ private suspend fun analyzeRegionActivity(
             i++
         }
     }
-    return windows.sortedByDescending { it.changeScore }.take(25)
+    val totalScore = changeCounts.sum()
+    return RegionActivity(windows.sortedByDescending { it.changeScore }.take(25), totalScore)
+}
+
+/**
+ * Reads [region] repeatedly (with a short delay between reads, so real
+ * gameplay has a chance to actually change something), then diffs
+ * consecutive samples byte-by-byte to find which offsets are genuinely
+ * "live" — this is the same fundamental idea behind a GameGuardian-style
+ * "unknown initial value, search by what changed" scan, just applied
+ * automatically across a whole region instead of one address at a time.
+ */
+private suspend fun analyzeRegionActivity(
+    context: android.content.Context,
+    pid: Int,
+    region: MemoryRegion,
+    samples: Int,
+    intervalMs: Long,
+    onProgress: (done: Int, total: Int) -> Unit
+): RegionActivity {
+    val size = region.size.toInt()
+    if (size <= 0) return RegionActivity(emptyList(), 0)
+
+    val snapshots = ArrayList<ByteArray>(samples)
+    repeat(samples) { i ->
+        val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size)
+        if (bytes != null) snapshots.add(bytes)
+        onProgress(i + 1, samples)
+        if (i < samples - 1) delay(intervalMs)
+    }
+    return computeRegionActivity(snapshots, size)
+}
+
+/**
+ * Same idea as [analyzeRegionActivity], but across every region at once —
+ * and, crucially, *interleaved*: each round reads every region once before
+ * moving to the next round, rather than fully sampling region A and then
+ * fully sampling region B. That means every region gets compared at the
+ * same moments in time (fairer — a burst of activity between two rounds
+ * shows up for all of them at once), and the whole scan still only takes
+ * samples × interval, not that multiplied by the number of regions.
+ */
+private suspend fun analyzeAllRegionsActivity(
+    context: android.content.Context,
+    pid: Int,
+    regions: List<MemoryRegion>,
+    samples: Int,
+    intervalMs: Long,
+    onProgress: (done: Int, total: Int) -> Unit
+): Map<MemoryRegion, RegionActivity> {
+    if (regions.isEmpty()) return emptyMap()
+    val snapshotsByRegion = HashMap<MemoryRegion, MutableList<ByteArray>>()
+    regions.forEach { snapshotsByRegion[it] = ArrayList(samples) }
+
+    repeat(samples) { i ->
+        for (region in regions) {
+            val bytes = RootMemoryHelper.readMemory(context, pid, region.start, region.size.toInt())
+            if (bytes != null) snapshotsByRegion.getValue(region).add(bytes)
+        }
+        onProgress(i + 1, samples)
+        if (i < samples - 1) delay(intervalMs)
+    }
+
+    return regions.associateWith { region ->
+        computeRegionActivity(snapshotsByRegion.getValue(region), region.size.toInt())
+    }
 }
 
 private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
@@ -215,13 +255,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     // added target gets corrupted together each cycle.
     var targets by remember { mutableStateOf<List<CorruptionTarget>>(emptyList()) }
 
-    // Activity-scan state: which (process, region) is currently being
-    // analyzed, its progress, sample count, and the resulting hot windows.
-    var analysisTarget by remember { mutableStateOf<CorruptionTarget?>(null) }
+    // Activity-scan state, shared by both the per-region and "analyze
+    // everything" flows — every measured region's result lands in the same
+    // map, so the region list can rank by it regardless of which flow ran.
+    var regionActivity by remember { mutableStateOf<Map<MemoryRegion, RegionActivity>>(emptyMap()) }
+    var expandedActivityRegion by remember { mutableStateOf<MemoryRegion?>(null) }
     var analysisRunning by remember { mutableStateOf(false) }
     var analysisProgress by remember { mutableStateOf(0 to 0) }
     var analysisSamples by remember { mutableStateOf(8f) }
-    var hotWindows by remember { mutableStateOf<List<HotWindow>>(emptyList()) }
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
@@ -453,6 +494,8 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                     regions = emptyList()
                                     previousRegions = emptySet()
                                     scanCount = 0
+                                    regionActivity = emptyMap()
+                                    expandedActivityRegion = null
                                     // targets deliberately NOT cleared here —
                                     // switching process is how you add a
                                     // second process's region to the same
@@ -494,18 +537,57 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 var regionPathFilter by remember { mutableStateOf("") }
                 val isNewRegion: (MemoryRegion) -> Boolean = { scanCount > 1 && it !in previousRegions }
 
-                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount, regionPathFilter) {
+                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount, regionPathFilter, regionActivity) {
                     val filtered = if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
                         else regions.filter { it.isSafeToCorrupt && it.size >= 4096 && !looksLikeNoise(it) }
                     val pathMatched = if (regionPathFilter.isBlank()) filtered
                         else filtered.filter { it.path.contains(regionPathFilter, ignoreCase = true) }
-                    // New-since-last-scan regions float to the top, then
-                    // Scudo-named ones (field-confirmed promising), then by
-                    // size within each tier.
+                    // Measured activity (from an activity scan) is the strongest
+                    // signal there is, so it takes priority over every other
+                    // heuristic — regions never yet measured sort below any
+                    // that were, regardless of label or size. New-since-scan,
+                    // then Scudo/library-segment, then size are just tie-breakers
+                    // among not-yet-measured regions.
                     pathMatched.sortedWith(
-                        compareByDescending<MemoryRegion> { isNewRegion(it) }
+                        compareByDescending<MemoryRegion> { regionActivity[it]?.totalScore ?: -1 }
+                            .thenByDescending { isNewRegion(it) }
                             .thenByDescending { looksRecommended(it) }
                             .thenByDescending { it.size }
+                    )
+                }
+
+                if (visibleRegions.isNotEmpty()) {
+                    Button(
+                        onClick = {
+                            val toScan = visibleRegions
+                            analysisRunning = true
+                            analysisProgress = 0 to analysisSamples.toInt()
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    analyzeAllRegionsActivity(
+                                        context, proc.pid, toScan,
+                                        samples = analysisSamples.toInt().coerceAtLeast(2),
+                                        intervalMs = 150L
+                                    ) { done, total -> analysisProgress = done to total }
+                                }
+                                regionActivity = regionActivity + result
+                                expandedActivityRegion = result.maxByOrNull { it.value.totalScore }?.key
+                                analysisRunning = false
+                            }
+                        },
+                        enabled = !analysisRunning,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Insights, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Analyze All ${visibleRegions.size} Visible Regions")
+                    }
+                    Text(
+                        "Estimated time: ~${(analysisSamples.toInt() * 150L / 1000.0).let { "%.1f".format(it) }}s for the scan itself, " +
+                            "plus overhead per region per sample — the more regions and samples, the longer, " +
+                            "but every region is sampled at the same moments either way.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
@@ -579,7 +661,13 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                 val isNew = isNewRegion(region)
                                 val isRecommended = looksRecommended(region)
                                 ListItem(
-                                    headlineContent = { Text(formatSize(region.size)) },
+                                    headlineContent = {
+                                        val score = regionActivity[region]?.totalScore
+                                        Text(
+                                            formatSize(region.size) +
+                                                if (score != null) "   •   activity: $score" else ""
+                                        )
+                                    },
                                     supportingContent = {
                                         Text(
                                             "0x${region.start.toString(16)} - 0x${region.end.toString(16)}  ${region.perms}" +
@@ -613,10 +701,9 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                             }
                                             IconButton(
                                                 onClick = {
-                                                    val target = CorruptionTarget(proc, region)
-                                                    analysisTarget = target
-                                                    hotWindows = emptyList()
+                                                    expandedActivityRegion = region
                                                     analysisRunning = true
+                                                    analysisProgress = 0 to analysisSamples.toInt()
                                                     scope.launch {
                                                         val result = withContext(Dispatchers.IO) {
                                                             analyzeRegionActivity(
@@ -625,7 +712,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                                 intervalMs = 150L
                                                             ) { done, total -> analysisProgress = done to total }
                                                         }
-                                                        hotWindows = result
+                                                        regionActivity = regionActivity + (region to result)
                                                         analysisRunning = false
                                                     }
                                                 },
@@ -651,23 +738,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
                 Column {
                     Text(
-                        "Activity scan samples: ${analysisSamples.toInt()}",
+                        "Activity scan samples: ${analysisSamples.toInt()}  (~${(analysisSamples.toInt() * 150L / 1000.0).let { "%.1f".format(it) }}s)",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Slider(
                         value = analysisSamples,
                         onValueChange = { analysisSamples = it },
-                        valueRange = 4f..20f,
-                        steps = 15,
+                        valueRange = 4f..300f,
                         enabled = !analysisRunning
                     )
                     Text(
-                        "Tap the 🔍 next to a region to sample it repeatedly and find bytes that are " +
-                            "actually changing — a real measurement instead of a guess. Do this while " +
-                            "something is happening in the target (moving, taking damage, a HUD counter " +
-                            "ticking) so there's something to detect. More samples take longer but catch " +
-                            "slower-changing state too.",
+                        "Analyze one region with the 🔍 next to it, or every visible region at once with " +
+                            "the button above, to find bytes that are actually changing — a real measurement " +
+                            "instead of a guess. Do this while something is happening in the target (moving, " +
+                            "taking damage, a HUD counter ticking) so there's something to detect. More " +
+                            "samples take longer but catch slower-changing state too, and cost the same " +
+                            "either way whether you're scanning one region or all of them at once.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -680,16 +767,17 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
-                        "Sampling ${analysisTarget?.region?.let { formatSize(it.size) } ?: ""}… ($done/$total)",
+                        "Sampling… ($done/$total rounds)",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
-                if (!analysisRunning && analysisTarget != null) {
-                    val target = analysisTarget!!
-                    Text("Activity in ${formatSize(target.region.size)} region", style = MaterialTheme.typography.titleMedium)
-                    if (hotWindows.isEmpty()) {
+                val expandedRegion = expandedActivityRegion
+                if (!analysisRunning && expandedRegion != null) {
+                    val activity = regionActivity[expandedRegion]
+                    Text("Activity in ${formatSize(expandedRegion.size)} region", style = MaterialTheme.typography.titleMedium)
+                    if (activity == null || activity.windows.isEmpty()) {
                         Text(
                             "Nothing changed across the sampled window. Either nothing was happening in " +
                                 "the target during the scan, or this region really is static — try again " +
@@ -700,7 +788,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     } else {
                         Card {
                             Column(Modifier.padding(8.dp)) {
-                                hotWindows.forEach { w ->
+                                activity.windows.forEach { w ->
                                     ListItem(
                                         headlineContent = {
                                             Text("0x${w.offsetStart.toString(16)} - 0x${w.offsetEnd.toString(16)}  (${w.size} bytes)")
@@ -708,7 +796,8 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         supportingContent = { Text("Changed ${w.changeScore} time(s) across the samples") },
                                         trailingContent = {
                                             TextButton(onClick = {
-                                                if (targets.none { it.process.pid == target.process.pid && it.region == target.region }) {
+                                                val target = CorruptionTarget(proc, expandedRegion)
+                                                if (targets.none { it.process.pid == proc.pid && it.region == expandedRegion }) {
                                                     targets = targets + target
                                                 }
                                                 val eng = engine
