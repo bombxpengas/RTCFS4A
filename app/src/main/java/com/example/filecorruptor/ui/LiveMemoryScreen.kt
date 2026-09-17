@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.io.File
 import com.example.filecorruptor.engine.CorruptionEngineExecutor
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.engine.ParamValue
@@ -109,23 +110,11 @@ private data class HotWindow(val offsetStart: Int, val offsetEnd: Int, val chang
  *  regions be ranked against *each other*, not just windows within one. */
 private data class RegionActivity(val windows: List<HotWindow>, val totalScore: Int)
 
-/** Shared by both the single-region and batch analyzers: diffs consecutive
- *  snapshots byte-by-byte, then clusters nearby changed offsets (small gaps
- *  tolerated) into a short, rankable list of windows instead of a raw
- *  per-byte dump. */
-private fun computeRegionActivity(snapshots: List<ByteArray>, size: Int): RegionActivity {
-    if (snapshots.size < 2 || size <= 0) return RegionActivity(emptyList(), 0)
-
-    val changeCounts = IntArray(size)
-    for (i in 1 until snapshots.size) {
-        val prev = snapshots[i - 1]
-        val curr = snapshots[i]
-        if (prev.size != size || curr.size != size) continue
-        for (j in 0 until size) {
-            if (prev[j] != curr[j]) changeCounts[j]++
-        }
-    }
-
+/** Clusters a finished per-byte change-count array into a short, rankable
+ *  list of windows (small gaps between changed bytes tolerated) instead of
+ *  a raw per-byte dump. Shared by both the single-region and batch paths. */
+private fun windowsFromChangeCounts(changeCounts: IntArray): RegionActivity {
+    val size = changeCounts.size
     val maxGapBytes = 16
     val windows = mutableListOf<HotWindow>()
     var i = 0
@@ -154,11 +143,14 @@ private fun computeRegionActivity(snapshots: List<ByteArray>, size: Int): Region
 
 /**
  * Reads [region] repeatedly (with a short delay between reads, so real
- * gameplay has a chance to actually change something), then diffs
- * consecutive samples byte-by-byte to find which offsets are genuinely
- * "live" — this is the same fundamental idea behind a GameGuardian-style
- * "unknown initial value, search by what changed" scan, just applied
- * automatically across a whole region instead of one address at a time.
+ * gameplay has a chance to actually change something), diffing each new
+ * read against only the *previous* one and then discarding it — this is
+ * the fix for a real crash: the first version kept every sample's full
+ * byte array in memory until the very end, so memory scaled with
+ * samples × region size. With the sample cap raised to 300, that could
+ * mean holding hundreds of copies of a multi-MB region at once — an easy
+ * OutOfMemoryError. A running per-byte change-count array is all that's
+ * actually needed, so memory here no longer depends on sample count at all.
  */
 private suspend fun analyzeRegionActivity(
     context: android.content.Context,
@@ -171,14 +163,23 @@ private suspend fun analyzeRegionActivity(
     val size = region.size.toInt()
     if (size <= 0) return RegionActivity(emptyList(), 0)
 
-    val snapshots = ArrayList<ByteArray>(samples)
+    val changeCounts = IntArray(size)
+    var previous: ByteArray? = null
     repeat(samples) { i ->
         val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size)
-        if (bytes != null) snapshots.add(bytes)
+        if (bytes != null) {
+            val prev = previous
+            if (prev != null && prev.size == size && bytes.size == size) {
+                for (j in 0 until size) {
+                    if (prev[j] != bytes[j]) changeCounts[j]++
+                }
+            }
+            previous = bytes // replaces the old array, which is now free to be collected
+        }
         onProgress(i + 1, samples)
         if (i < samples - 1) delay(intervalMs)
     }
-    return computeRegionActivity(snapshots, size)
+    return windowsFromChangeCounts(changeCounts)
 }
 
 /**
@@ -189,6 +190,17 @@ private suspend fun analyzeRegionActivity(
  * same moments in time (fairer — a burst of activity between two rounds
  * shows up for all of them at once), and the whole scan still only takes
  * samples × interval, not that multiplied by the number of regions.
+ *
+ * Each region's *previous* sample lives in its own small temp file rather
+ * than an in-memory map — read the old one, compare, overwrite it with the
+ * new one, move on. That keeps only one region's snapshot in RAM at a time
+ * no matter how many regions are being batch-analyzed, instead of holding
+ * every region's previous snapshot simultaneously (which is what could
+ * still add up with "Analyze All" across many/large regions even after the
+ * streaming fix above). The running per-byte change-count arrays still
+ * live in memory for the whole scan — an unavoidable minimum, since a
+ * cumulative count has to accumulate somewhere — but that's the much
+ * smaller of the two costs.
  */
 private suspend fun analyzeAllRegionsActivity(
     context: android.content.Context,
@@ -199,21 +211,35 @@ private suspend fun analyzeAllRegionsActivity(
     onProgress: (done: Int, total: Int) -> Unit
 ): Map<MemoryRegion, RegionActivity> {
     if (regions.isEmpty()) return emptyMap()
-    val snapshotsByRegion = HashMap<MemoryRegion, MutableList<ByteArray>>()
-    regions.forEach { snapshotsByRegion[it] = ArrayList(samples) }
+    val changeCountsByRegion = regions.associateWith { IntArray(it.size.toInt()) }
+    val tempFiles = regions.associateWith { region ->
+        File(context.cacheDir, "rtmem_activity_${region.start.toString(16)}_${System.nanoTime()}.tmp")
+    }
 
-    repeat(samples) { i ->
-        for (region in regions) {
-            val bytes = RootMemoryHelper.readMemory(context, pid, region.start, region.size.toInt())
-            if (bytes != null) snapshotsByRegion.getValue(region).add(bytes)
+    try {
+        repeat(samples) { i ->
+            for (region in regions) {
+                val size = region.size.toInt()
+                if (size <= 0) continue
+                val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size) ?: continue
+                val tempFile = tempFiles.getValue(region)
+                if (tempFile.exists() && tempFile.length() == size.toLong()) {
+                    val prev = tempFile.readBytes()
+                    val counts = changeCountsByRegion.getValue(region)
+                    for (j in 0 until size) {
+                        if (prev[j] != bytes[j]) counts[j]++
+                    }
+                }
+                tempFile.writeBytes(bytes) // overwrites for the next round's comparison
+            }
+            onProgress(i + 1, samples)
+            if (i < samples - 1) delay(intervalMs)
         }
-        onProgress(i + 1, samples)
-        if (i < samples - 1) delay(intervalMs)
+    } finally {
+        tempFiles.values.forEach { it.delete() } // always clean up, even on failure/cancellation
     }
 
-    return regions.associateWith { region ->
-        computeRegionActivity(snapshotsByRegion.getValue(region), region.size.toInt())
-    }
+    return regions.associateWith { region -> windowsFromChangeCounts(changeCountsByRegion.getValue(region)) }
 }
 
 private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
@@ -563,16 +589,29 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             analysisRunning = true
                             analysisProgress = 0 to analysisSamples.toInt()
                             scope.launch {
-                                val result = withContext(Dispatchers.IO) {
-                                    analyzeAllRegionsActivity(
-                                        context, proc.pid, toScan,
-                                        samples = analysisSamples.toInt().coerceAtLeast(2),
-                                        intervalMs = 150L
-                                    ) { done, total -> analysisProgress = done to total }
+                                val outcome = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        analyzeAllRegionsActivity(
+                                            context, proc.pid, toScan,
+                                            samples = analysisSamples.toInt().coerceAtLeast(2),
+                                            intervalMs = 150L
+                                        ) { done, total -> analysisProgress = done to total }
+                                    }
                                 }
-                                regionActivity = regionActivity + result
-                                expandedActivityRegion = result.maxByOrNull { it.value.totalScore }?.key
                                 analysisRunning = false
+                                outcome.onSuccess { result ->
+                                    regionActivity = regionActivity + result
+                                    expandedActivityRegion = result.maxByOrNull { it.value.totalScore }?.key
+                                }.onFailure { e ->
+                                    isErrorStatus = true
+                                    statusMessage = if (e is OutOfMemoryError) {
+                                        "Ran out of memory analyzing ${toScan.size} region(s) at once — try fewer " +
+                                            "samples, or narrow the list first (the path filter or unchecking " +
+                                            "\"Show everything\") before analyzing everything."
+                                    } else {
+                                        "Analysis failed: ${e.message}"
+                                    }
+                                }
                             }
                         },
                         enabled = !analysisRunning,
@@ -705,15 +744,26 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                     analysisRunning = true
                                                     analysisProgress = 0 to analysisSamples.toInt()
                                                     scope.launch {
-                                                        val result = withContext(Dispatchers.IO) {
-                                                            analyzeRegionActivity(
-                                                                context, proc.pid, region,
-                                                                samples = analysisSamples.toInt().coerceAtLeast(2),
-                                                                intervalMs = 150L
-                                                            ) { done, total -> analysisProgress = done to total }
+                                                        val outcome = withContext(Dispatchers.IO) {
+                                                            runCatching {
+                                                                analyzeRegionActivity(
+                                                                    context, proc.pid, region,
+                                                                    samples = analysisSamples.toInt().coerceAtLeast(2),
+                                                                    intervalMs = 150L
+                                                                ) { done, total -> analysisProgress = done to total }
+                                                            }
                                                         }
-                                                        regionActivity = regionActivity + (region to result)
                                                         analysisRunning = false
+                                                        outcome.onSuccess { result ->
+                                                            regionActivity = regionActivity + (region to result)
+                                                        }.onFailure { e ->
+                                                            isErrorStatus = true
+                                                            statusMessage = if (e is OutOfMemoryError) {
+                                                                "Ran out of memory analyzing this ${formatSize(region.size)} region — try fewer samples."
+                                                            } else {
+                                                                "Analysis failed: ${e.message}"
+                                                            }
+                                                        }
                                                     }
                                                 },
                                                 enabled = !analysisRunning
