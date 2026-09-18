@@ -79,6 +79,20 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
  *  same isolation pattern, since this isn't a Lemuroid-only trick. */
 private val LIKELY_EMULATION_PROCESS_SUFFIXES = listOf("game", "emu", "emulator", "core", "libretro")
 
+/** Common console RAM/VRAM sizes, as quick-fill presets for the activity
+ *  scanner's target-size search — saves typing out well-known byte counts. */
+private val COMMON_MEMORY_SIZE_PRESETS = listOf(
+    "2KB (NES RAM)" to 2 * 1024,
+    "8KB (Game Boy RAM)" to 8 * 1024,
+    "16KB (SMS RAM)" to 16 * 1024,
+    "64KB (Genesis RAM)" to 64 * 1024,
+    "128KB (SNES WRAM)" to 128 * 1024,
+    "256KB (GBA EWRAM)" to 256 * 1024,
+    "2MB (PS1 RAM)" to 2 * 1024 * 1024,
+    "4MB (N64 RAM)" to 4 * 1024 * 1024,
+    "24MB (DS RAM)" to 24 * 1024 * 1024
+)
+
 private fun looksLikeEmulationProcess(processName: String): Boolean {
     val suffix = processName.substringAfter(':', missingDelimiterValue = "").lowercase()
     return suffix.isNotEmpty() && LIKELY_EMULATION_PROCESS_SUFFIXES.any { suffix.contains(it) }
@@ -93,10 +107,13 @@ private data class HotWindow(val offsetStart: Int, val offsetEnd: Int, val chang
     val size: Int get() = offsetEnd - offsetStart
 }
 
-/** Result of analyzing one region: its hot windows (ranked) and the total
- *  activity score across the whole region — the latter is what lets
- *  regions be ranked against *each other*, not just windows within one. */
-private data class RegionActivity(val windows: List<HotWindow>, val totalScore: Int)
+/** Result of analyzing one region: its hot windows (ranked), the total
+ *  activity score across the whole region (for ranking regions against
+ *  each other), and the raw per-byte change counts — kept around so a
+ *  fixed-size search can be re-run instantly against already-collected
+ *  data instead of needing a fresh (expensive) scan every time you tweak
+ *  the target size. */
+private data class RegionActivity(val windows: List<HotWindow>, val totalScore: Int, val changeCounts: IntArray)
 
 /** Clusters a finished per-byte change-count array into a short, rankable
  *  list of windows (small gaps between changed bytes tolerated) instead of
@@ -126,7 +143,46 @@ private fun windowsFromChangeCounts(changeCounts: IntArray): RegionActivity {
         }
     }
     val totalScore = changeCounts.sum()
-    return RegionActivity(windows.sortedByDescending { it.changeScore }.take(25), totalScore)
+    return RegionActivity(windows.sortedByDescending { it.changeScore }.take(25), totalScore, changeCounts)
+}
+
+/**
+ * Instead of letting window size fall out of however far apart changed
+ * bytes happen to be (windowsFromChangeCounts above), this slides a window
+ * of exactly [targetSize] bytes across the region and finds where the
+ * *sum* of activity inside that exact span is highest — e.g. "is there a
+ * contiguous 2048-byte block that's unusually active", which is a much
+ * more direct way to go looking for something like a NES's RAM or a
+ * known-size VRAM/palette buffer than eyeballing gap-clustered windows of
+ * whatever size they happened to form. Uses a prefix-sum so every
+ * candidate position is an O(1) lookup rather than re-summing each time.
+ * Non-max suppression avoids returning a dozen near-identical windows
+ * that are really just the same hot spot shifted by a few bytes.
+ */
+private fun findBestFixedSizeWindows(changeCounts: IntArray, targetSize: Int, topN: Int = 10): List<HotWindow> {
+    val size = changeCounts.size
+    if (targetSize <= 0 || targetSize > size) return emptyList()
+
+    val prefix = LongArray(size + 1)
+    for (i in 0 until size) prefix[i + 1] = prefix[i] + changeCounts[i]
+
+    val candidates = ArrayList<Pair<Int, Long>>(size - targetSize + 1)
+    for (start in 0..(size - targetSize)) {
+        val score = prefix[start + targetSize] - prefix[start]
+        if (score > 0) candidates.add(start to score)
+    }
+    candidates.sortByDescending { it.second }
+
+    val picked = mutableListOf<HotWindow>()
+    for ((start, score) in candidates) {
+        if (picked.size >= topN) break
+        val end = start + targetSize
+        val overlapsExisting = picked.any { w -> start < w.offsetEnd && end > w.offsetStart }
+        if (!overlapsExisting) {
+            picked.add(HotWindow(start, end, score.toInt()))
+        }
+    }
+    return picked
 }
 
 /**
@@ -277,6 +333,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     var analysisRunning by remember { mutableStateOf(false) }
     var analysisProgress by remember { mutableStateOf(0 to 0) }
     var analysisSamples by remember { mutableStateOf(8f) }
+    var targetSizeText by remember { mutableStateOf("") }
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
@@ -782,6 +839,31 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    OutlinedTextField(
+                        value = targetSizeText,
+                        onValueChange = { targetSizeText = it.filter { c -> c.isDigit() } },
+                        label = { Text("Target size in bytes (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Leave blank to see activity windows as they naturally cluster. Set a size to " +
+                            "instead search for exactly that many contiguous bytes with the most combined " +
+                            "activity — useful for spotting a known-size buffer (a console's RAM, VRAM, or " +
+                            "similar) hiding inside a much larger region. Re-runs instantly against data " +
+                            "you've already scanned, no need to scan again after changing it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(COMMON_MEMORY_SIZE_PRESETS) { (label, bytes) ->
+                            AssistChip(
+                                onClick = { targetSizeText = bytes.toString() },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
                 }
 
                 if (analysisRunning) {
@@ -800,10 +882,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 val expandedRegion = expandedActivityRegion
                 if (!analysisRunning && expandedRegion != null) {
                     val activity = regionActivity[expandedRegion]
-                    Text("Activity in ${formatSize(expandedRegion.size)} region", style = MaterialTheme.typography.titleMedium)
-                    if (activity == null || activity.windows.isEmpty()) {
+                    val targetSize = targetSizeText.toIntOrNull()?.takeIf { it > 0 }
+                    val displayWindows = when {
+                        activity == null -> emptyList()
+                        targetSize != null -> findBestFixedSizeWindows(activity.changeCounts, targetSize)
+                        else -> activity.windows
+                    }
+                    Text(
+                        if (targetSize != null) "Best ${targetSize}-byte spans in ${formatSize(expandedRegion.size)} region"
+                        else "Activity in ${formatSize(expandedRegion.size)} region",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    if (activity == null || displayWindows.isEmpty()) {
                         Text(
-                            "Nothing changed across the sampled window. Either nothing was happening in " +
+                            if (targetSize != null && activity != null && activity.windows.isNotEmpty())
+                                "No $targetSize-byte span in this region had any activity — try a different size, " +
+                                    "or clear it to see the naturally-clustered windows instead."
+                            else "Nothing changed across the sampled window. Either nothing was happening in " +
                                 "the target during the scan, or this region really is static — try again " +
                                 "while something is actively occurring, or pick a different region.",
                             style = MaterialTheme.typography.bodySmall,
@@ -812,7 +907,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     } else {
                         Card {
                             Column(Modifier.padding(8.dp)) {
-                                activity.windows.forEach { w ->
+                                displayWindows.forEach { w ->
                                     ListItem(
                                         headlineContent = {
                                             Text("0x${w.offsetStart.toString(16)} - 0x${w.offsetEnd.toString(16)}  (${w.size} bytes)")
