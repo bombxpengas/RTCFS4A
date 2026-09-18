@@ -205,7 +205,7 @@ private suspend fun analyzeRegionActivity(
     onProgress: (done: Int, total: Int) -> Unit
 ): RegionActivity {
     val size = region.size.toInt()
-    if (size <= 0) return RegionActivity(emptyList(), 0)
+    if (size <= 0) return RegionActivity(emptyList(), 0, IntArray(0))
 
     val changeCounts = IntArray(size)
     var previous: ByteArray? = null
