@@ -71,18 +71,6 @@ private fun looksLikeNoise(region: MemoryRegion): Boolean {
     return NOISY_PATH_MARKERS.any { marker -> p.contains(marker) }
 }
 
-/** Field- and source-confirmed good candidates get a ★:
- *  - Scudo (Android's own hardened malloc) arenas — see comment above.
- *  - A loaded library's own writable, non-executable segment — this is
- *    where FCEUmm keeps RAM/NTARAM/PALRAM as plain static arrays, and any
- *    core built the same way (an older, C-style codebase with fixed-size
- *    console memory as top-level globals rather than malloc'd) will keep
- *    its own state there too. isSafeToCorrupt already guarantees this
- *    isn't the dangerous executable code segment of the same library. */
-private fun looksRecommended(region: MemoryRegion): Boolean =
-    region.path.contains("scudo", ignoreCase = true) ||
-    (region.path.contains(".so", ignoreCase = true) && region.isSafeToCorrupt)
-
 /** Source-confirmed with Lemuroid: it declares android:process=":game" on its
  *  GameActivity specifically so a crashing libretro core takes down only
  *  that process, not the whole app — the real emulation core and its RAM
@@ -569,15 +557,17 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     val pathMatched = if (regionPathFilter.isBlank()) filtered
                         else filtered.filter { it.path.contains(regionPathFilter, ignoreCase = true) }
                     // Measured activity (from an activity scan) is the strongest
-                    // signal there is, so it takes priority over every other
-                    // heuristic — regions never yet measured sort below any
-                    // that were, regardless of label or size. New-since-scan,
-                    // then Scudo/library-segment, then size are just tie-breakers
-                    // among not-yet-measured regions.
+                    // signal there is — it's an actual measurement, not a
+                    // guess, so it takes priority over everything else.
+                    // Below that, new-since-scan and size are just tie-breakers
+                    // among not-yet-measured regions. Label-based "this kind of
+                    // region tends to be good" heuristics were tried and
+                    // deliberately removed — which region matters turned out to
+                    // vary too much per emulator/core to be a reliable signal,
+                    // and a false "recommended" label is worse than no label.
                     pathMatched.sortedWith(
                         compareByDescending<MemoryRegion> { regionActivity[it]?.totalScore ?: -1 }
                             .thenByDescending { isNewRegion(it) }
-                            .thenByDescending { looksRecommended(it) }
                             .thenByDescending { it.size }
                     )
                 }
@@ -670,17 +660,13 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
 
                 if (visibleRegions.isNotEmpty()) {
                     Text(
-                        "For a fixed-hardware emulator, pick the region whose size matches the console's " +
-                            "own RAM — e.g. ~2KB NES, ~128KB SNES WRAM, ~2MB PS1, ~4-8MB N64, ~24MB DS. " +
-                            "For a modern game with no fixed RAM size (like Minecraft), that trick doesn't " +
-                            "apply — favor unlabeled anonymous regions and ★-marked ones instead, since a " +
-                            "native engine's own memory tends to live in one of those. A ★ on a region " +
-                            "belonging to a loaded .so is its writable, non-executable data segment — some " +
-                            "emulator cores (FCEUmm's NES core, for one) keep their entire console RAM as " +
-                            "plain static arrays there rather than a separate heap buffer, so it's worth " +
-                            "checking even though it's technically part of a library file. Tap a region to " +
-                            "add or remove it from the target list below — add several at once (even from a " +
-                            "different process) to widen the net.",
+                        "Which region actually matters varies a lot by emulator/core — there's no reliable " +
+                            "label or size rule that predicts it, so trial and error (or the Analyze button " +
+                            "below) is the honest way to find out, not a recommendation. A 🌱 just means a " +
+                            "region appeared since your last scan of this process — a real, factual signal, " +
+                            "not a guess about whether it's worth targeting. Tap a region to add or remove " +
+                            "it from the target list below — add several at once (even from a different " +
+                            "process) to widen the net.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -698,7 +684,6 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             items(visibleRegions) { region ->
                                 val isTargeted = targets.any { it.process.pid == proc.pid && it.region == region }
                                 val isNew = isNewRegion(region)
-                                val isRecommended = looksRecommended(region)
                                 ListItem(
                                     headlineContent = {
                                         val score = regionActivity[region]?.totalScore
@@ -714,23 +699,12 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         )
                                     },
                                     leadingContent = {
-                                        if (isNew || isRecommended) {
-                                            Row {
-                                                if (isNew) {
-                                                    Icon(
-                                                        Icons.Filled.Eco,
-                                                        contentDescription = "New since last scan",
-                                                        tint = MaterialTheme.colorScheme.primary
-                                                    )
-                                                }
-                                                if (isRecommended) {
-                                                    Icon(
-                                                        Icons.Filled.Star,
-                                                        contentDescription = "Recommended (Scudo heap arena)",
-                                                        tint = MaterialTheme.colorScheme.primary
-                                                    )
-                                                }
-                                            }
+                                        if (isNew) {
+                                            Icon(
+                                                Icons.Filled.Eco,
+                                                contentDescription = "New since last scan",
+                                                tint = MaterialTheme.colorScheme.primary
+                                            )
                                         }
                                     },
                                     trailingContent = {
