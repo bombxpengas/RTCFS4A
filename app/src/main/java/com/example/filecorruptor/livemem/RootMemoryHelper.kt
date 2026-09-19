@@ -1,4 +1,4 @@
-package com.android.rtc.livemem
+package com.example.filecorruptor.livemem
 
 import android.content.Context
 import java.io.BufferedReader

@@ -1,4 +1,4 @@
-package com.android.rtc.ui
+package com.example.filecorruptor.ui
 
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,7 +17,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.android.rtc.engine.EngineViewModel
+import com.example.filecorruptor.engine.EngineViewModel
 
 @Composable
 fun SettingsScreen(engineViewModel: EngineViewModel = viewModel()) {

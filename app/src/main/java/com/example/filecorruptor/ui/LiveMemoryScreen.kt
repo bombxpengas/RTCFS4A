@@ -1,4 +1,4 @@
-package com.android.rtc.ui
+package com.example.filecorruptor.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -29,13 +29,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.io.File
-import com.android.rtc.engine.CorruptionEngineExecutor
-import com.android.rtc.engine.EngineViewModel
-import com.android.rtc.engine.ParamValue
-import com.android.rtc.engine.isVisible
-import com.android.rtc.livemem.LiveProcess
-import com.android.rtc.livemem.MemoryRegion
-import com.android.rtc.livemem.RootMemoryHelper
+import com.example.filecorruptor.engine.CorruptionEngineExecutor
+import com.example.filecorruptor.engine.EngineViewModel
+import com.example.filecorruptor.engine.ParamValue
+import com.example.filecorruptor.engine.isVisible
+import com.example.filecorruptor.livemem.LiveProcess
+import com.example.filecorruptor.livemem.MemoryRegion
+import com.example.filecorruptor.livemem.RootMemoryHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -171,10 +171,27 @@ private fun findBestFixedSizeWindows(changeCounts: IntArray, targetSize: Int, to
         val score = prefix[start + targetSize] - prefix[start]
         if (score > 0) candidates.add(start to score)
     }
-    candidates.sortByDescending { it.second }
+
+    // In a region that's genuinely busy almost everywhere (a shared Scudo
+    // primary arena serving many small/medium allocations at once is the
+    // textbook case), a plain top-N will surface a pile of merely-average
+    // spans rather than anything that actually stands out — there isn't a
+    // bug to fix there, that's an accurate reflection of the region really
+    // being active in many unrelated places simultaneously. What this can
+    // do is filter down to spans that are meaningfully above the region's
+    // own average, so what's left is closer to "the standout spots" than
+    // "everywhere with any activity at all". If a region has no standout
+    // spots because it's uniformly busy, fewer (or zero) results below is
+    // itself informative — it suggests this isn't a single isolated buffer.
+    if (candidates.isEmpty()) return emptyList()
+    val meanScore = candidates.sumOf { it.second }.toDouble() / candidates.size
+    val threshold = meanScore * 1.5
+    val aboveAverage = candidates.filter { it.second >= threshold }
+    val pool = aboveAverage.ifEmpty { candidates } // fall back to unfiltered rather than showing nothing
+    val sortedCandidates = pool.sortedByDescending { it.second }
 
     val picked = mutableListOf<HotWindow>()
-    for ((start, score) in candidates) {
+    for ((start, score) in sortedCandidates) {
         if (picked.size >= topN) break
         val end = start + targetSize
         val overlapsExisting = picked.any { w -> start < w.offsetEnd && end > w.offsetStart }

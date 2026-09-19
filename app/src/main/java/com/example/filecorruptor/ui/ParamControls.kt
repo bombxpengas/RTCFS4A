@@ -1,4 +1,4 @@
-package com.android.rtc.ui
+package com.example.filecorruptor.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
@@ -9,9 +9,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.android.rtc.engine.ParamType
-import com.android.rtc.engine.ParamValue
-import com.android.rtc.engine.ParameterDef
+import com.example.filecorruptor.engine.ParamType
+import com.example.filecorruptor.engine.ParamValue
+import com.example.filecorruptor.engine.ParameterDef
 
 /**
  * Renders the right control for a [ParameterDef] and reports changes back via

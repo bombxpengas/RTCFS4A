@@ -1,4 +1,4 @@
-package com.android.rtc.ui.theme
+package com.example.filecorruptor.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle

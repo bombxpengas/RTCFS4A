@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.android.rtc"
+    namespace = "com.example.filecorruptor"
     compileSdk = 34
     // Pinned so a local build (Android Studio) and CI always compile the
     // native memory helper (see app/src/main/cpp) against the identical NDK
@@ -15,7 +15,7 @@ android {
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
-        applicationId = "com.android.rtc"
+        applicationId = "com.example.filecorruptor"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

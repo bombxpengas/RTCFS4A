@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "RTC4A"
+rootProject.name = "FileCorruptor"
 include(":app")

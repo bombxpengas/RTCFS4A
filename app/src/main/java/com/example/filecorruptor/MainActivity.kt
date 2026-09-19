@@ -1,4 +1,4 @@
-package com.android.rtc
+package com.example.filecorruptor
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -20,11 +20,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.android.rtc.engine.EngineViewModel
-import com.android.rtc.ui.CorruptorScreen
-import com.android.rtc.ui.LiveMemoryScreen
-import com.android.rtc.ui.SettingsScreen
-import com.android.rtc.ui.theme.Rtc4aTheme
+import com.example.filecorruptor.engine.EngineViewModel
+import com.example.filecorruptor.ui.CorruptorScreen
+import com.example.filecorruptor.ui.LiveMemoryScreen
+import com.example.filecorruptor.ui.SettingsScreen
+import com.example.filecorruptor.ui.theme.FileCorruptorTheme
 
 private sealed class Destination(val route: String, val label: String) {
     data object Corruptor : Destination("corruptor", "Corruptor")
@@ -39,7 +39,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            Rtc4aTheme {
+            FileCorruptorTheme {
                 AppRoot()
             }
         }

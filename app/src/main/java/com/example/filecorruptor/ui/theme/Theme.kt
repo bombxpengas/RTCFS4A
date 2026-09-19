@@ -1,4 +1,4 @@
-package com.android.rtc.ui.theme
+package com.example.filecorruptor.ui.theme
 
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -49,7 +49,7 @@ private val LightColors = lightColorScheme(
 )
 
 @Composable
-fun Rtc4aTheme(
+fun FileCorruptorTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit
