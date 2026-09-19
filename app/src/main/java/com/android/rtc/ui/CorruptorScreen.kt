@@ -1,4 +1,4 @@
-package com.example.filecorruptor.ui
+package com.android.rtc.ui
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -31,10 +31,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.filecorruptor.engine.CorruptionEngineExecutor
-import com.example.filecorruptor.engine.EngineViewModel
-import com.example.filecorruptor.engine.ParamValue
-import com.example.filecorruptor.engine.isVisible
+import com.android.rtc.engine.CorruptionEngineExecutor
+import com.android.rtc.engine.EngineViewModel
+import com.android.rtc.engine.ParamValue
+import com.android.rtc.engine.isVisible
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn

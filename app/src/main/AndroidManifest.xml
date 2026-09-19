@@ -8,12 +8,12 @@
         android:label="@string/app_name"
         android:largeHeap="true"
         android:supportsRtl="true"
-        android:theme="@style/Theme.FileCorruptor">
+        android:theme="@style/Theme.RTC4A">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.FileCorruptor"
+            android:theme="@style/Theme.RTC4A"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

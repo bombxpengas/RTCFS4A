@@ -1,4 +1,4 @@
-package com.example.filecorruptor.ui
+package com.android.rtc.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -29,13 +29,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.io.File
-import com.example.filecorruptor.engine.CorruptionEngineExecutor
-import com.example.filecorruptor.engine.EngineViewModel
-import com.example.filecorruptor.engine.ParamValue
-import com.example.filecorruptor.engine.isVisible
-import com.example.filecorruptor.livemem.LiveProcess
-import com.example.filecorruptor.livemem.MemoryRegion
-import com.example.filecorruptor.livemem.RootMemoryHelper
+import com.android.rtc.engine.CorruptionEngineExecutor
+import com.android.rtc.engine.EngineViewModel
+import com.android.rtc.engine.ParamValue
+import com.android.rtc.engine.isVisible
+import com.android.rtc.livemem.LiveProcess
+import com.android.rtc.livemem.MemoryRegion
+import com.android.rtc.livemem.RootMemoryHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch

@@ -1,4 +1,4 @@
-package com.example.filecorruptor.ui.theme
+package com.android.rtc.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
