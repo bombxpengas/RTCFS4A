@@ -92,11 +92,26 @@ private const val OAM_ENTRY_COUNT = OAM_SIZE / OAM_ENTRY_SIZE // 64
 
 /**
  * Slides a 32-byte window across [bytes] looking for palette-RAM shape:
- * every byte <= 0x3F, with at least [minDistinctValues] distinct values so
- * a boring all-zero (or other flat-fill) span — which trivially satisfies
- * "every byte <= 0x3F" without carrying any real signal — doesn't count.
- * The reference capture had 12 distinct values among 32 bytes; 6 is used
- * as a conservative floor so real-but-quieter palettes still match.
+ * every byte <= 0x3F, at least [minDistinctValues] distinct values, and a
+ * value spread of at least [minRange] (max byte minus min byte in the
+ * window) — reserved for the honesty note below.
+ *
+ * IMPORTANT HONESTY NOTE, added after real-device testing: this signal is
+ * much weaker than the class doc originally claimed. The original ~1e-19
+ * "unlikely by chance" estimate assumed uniformly random bytes, which is
+ * not what ordinary (non-palette) process memory looks like — counters,
+ * flags, array lengths, enum ordinals, and plain small integers are
+ * everywhere in real memory, and virtually all of them are <= 0x3F. A
+ * 32-byte span of "small numbers with some variety" is genuinely common,
+ * not rare, so this check alone produces real false positives on a real
+ * device — that's not device noise to tune away, it's this heuristic
+ * being weaker than advertised. [minRange] (requiring the window's values
+ * to span a reasonably wide slice of 0-63, not cluster near one end) cuts
+ * a real class of these — e.g. ASCII digit runs (0x30-0x39, range 9) — but
+ * doesn't fix the fundamental issue: on its own, this function is a *weak*
+ * signal and should not be trusted the way [findOamAnchors] can be. Treat
+ * a palette-only hit as "possible", not "likely" — see how LiveMemoryScreen
+ * sorts/labels these differently as a result.
  *
  * Runs a rolling histogram + rolling "count of bytes > max" so the whole
  * scan is O(bytes.size) regardless of region size, since these regions can
@@ -107,13 +122,15 @@ private const val OAM_ENTRY_COUNT = OAM_SIZE / OAM_ENTRY_SIZE // 64
  * every offset inside it, not just one — reporting all of them would just
  * be noise.
  */
-fun findPaletteRamAnchors(bytes: ByteArray, minDistinctValues: Int = 6): List<NesAnchorHit> {
+fun findPaletteRamAnchors(bytes: ByteArray, minDistinctValues: Int = 9, minRange: Int = 24): List<NesAnchorHit> {
     val n = bytes.size
     if (n < PALETTE_SIZE) return emptyList()
 
     val hist = IntArray(256)
     var distinct = 0
     var overLimit = 0
+    var minVal = 256
+    var maxVal = -1
 
     fun addByte(b: Int) {
         if (hist[b] == 0) distinct++
@@ -125,13 +142,27 @@ fun findPaletteRamAnchors(bytes: ByteArray, minDistinctValues: Int = 6): List<Ne
         if (hist[b] == 0) distinct--
         if (b > PALETTE_MAX_VALUE) overLimit--
     }
+    // min/max are recomputed from the histogram on each check rather than kept
+    // incrementally — O(256) worst case per window, which is fine since 256 is
+    // a constant, not something that scales with region size.
+    fun currentRange(): Int {
+        var lo = -1
+        var hi = -1
+        for (v in 0..255) {
+            if (hist[v] > 0) {
+                if (lo == -1) lo = v
+                hi = v
+            }
+        }
+        return if (lo == -1) 0 else hi - lo
+    }
 
     for (i in 0 until PALETTE_SIZE) addByte(bytes[i].toInt() and 0xFF)
 
     val hits = mutableListOf<NesAnchorHit>()
     var runStart = -1
 
-    fun windowPasses() = overLimit == 0 && distinct >= minDistinctValues
+    fun windowPasses() = overLimit == 0 && distinct >= minDistinctValues && currentRange() >= minRange
 
     var start = 0
     while (true) {
@@ -154,12 +185,12 @@ fun findPaletteRamAnchors(bytes: ByteArray, minDistinctValues: Int = 6): List<Ne
         hits.add(NesAnchorHit(NesAnchorKind.PALETTE_RAM, runStart, PALETTE_SIZE, confidence = 0.0))
     }
     // Recompute a real per-hit confidence from that hit's own actual distinct-value count,
-    // rather than the placeholder used mid-scan above.
+    // rather than the placeholder used mid-scan above. Capped at 0.6, not 0.98 — see the
+    // honesty note above; this signal earns "possible", never "likely", on its own.
     return hits.map { hit ->
         val slice = bytes.copyOfRange(hit.offset, hit.offset + PALETTE_SIZE)
         val distinctHere = slice.map { it.toInt() and 0xFF }.toSet().size
-        // More distinct values = less likely to be a coincidental flat/near-flat span.
-        val conf = (0.5 + 0.5 * (distinctHere.coerceAtMost(16) / 16.0)).coerceIn(0.5, 0.98)
+        val conf = (0.25 + 0.35 * (distinctHere.coerceAtMost(16) / 16.0)).coerceIn(0.25, 0.6)
         hit.copy(confidence = conf)
     }
 }
@@ -167,25 +198,43 @@ fun findPaletteRamAnchors(bytes: ByteArray, minDistinctValues: Int = 6): List<Ne
 /**
  * Looks for the "parked sprite" OAM signature: a long *contiguous run* of
  * one identical 4-byte group, whose first byte (the sprite's Y coordinate)
- * is at or above [yFloor]. Off-screen parking always uses a Y in
- * 0xF0-0xFF, since the NES's visible area is only 240 scanlines tall —
- * anything from 240 (0xF0) up is guaranteed off the bottom of the screen
- * regardless of which particular value (0xF8, 0xFE, 0xFF, ...) a given
- * game's code happens to load. Requiring *contiguity* (not just "this
- * value appears [minRun] times somewhere in a 256-byte window") is what
- * separates real parked-sprite rows from ordinary game data that happens
- * to reuse a byte value often but scattered — see the class doc for the
- * measured false-positive difference this made.
+ * is at or above [yFloor], excluding a group where all 4 bytes are equal.
+ *
+ * Off-screen parking always uses a Y in 0xF0-0xFF, since the NES's visible
+ * area is only 240 scanlines tall — anything from 240 (0xF0) up is
+ * guaranteed off the bottom of the screen regardless of which particular
+ * value (0xF8, 0xFE, 0xFF, ...) a given game's code happens to load.
+ *
+ * The all-4-bytes-equal exclusion exists because real-device testing found
+ * exactly the false positive it should: Android allocators commonly fill
+ * freed/guard/uninitialized memory with a single repeated poison byte —
+ * 0xFF and 0xFE are common choices — and a long run of solid `FF FF FF FF`
+ * or `FE FE FE FE` satisfies "identical 4-byte group, Y >= 0xF0" perfectly
+ * well while being unrelated to any game. A real parked sprite's group is
+ * `Y 00 00 00` (or similar) — two distinct byte values, not one — so
+ * rejecting solid fills removes this whole class of false hit while still
+ * matching the real pattern.
+ *
+ * Requiring *contiguity* (not just "this value appears [minRun] times
+ * somewhere in a 256-byte window") is what separates real parked-sprite
+ * rows from ordinary game data that happens to reuse a byte value often
+ * but scattered — an earlier version counted matches anywhere in a window
+ * and fired constantly on ordinary RAM as a result.
  *
  * Alignment isn't known in advance, so this tries 4 phases (byte offsets
  * 0..3 mod 4) rather than assuming the buffer starts on a 4-byte boundary
  * relative to wherever the scanned region happens to begin. Each phase is
  * a single O(n) pass, so the whole scan is O(n) regardless of region size.
  */
-fun findOamAnchors(bytes: ByteArray, minRun: Int = 12, yFloor: Int = 0xF0): List<NesAnchorHit> {
+fun findOamAnchors(bytes: ByteArray, minRun: Int = 16, yFloor: Int = 0xF0): List<NesAnchorHit> {
     val n = bytes.size
     if (n < OAM_ENTRY_SIZE * minRun) return emptyList()
     val hits = mutableListOf<NesAnchorHit>()
+
+    fun isSolidFill(key: Int): Boolean {
+        val b0 = key and 0xFF
+        return b0 == (key shr 8 and 0xFF) && b0 == (key shr 16 and 0xFF) && b0 == (key shr 24 and 0xFF)
+    }
 
     for (phase in 0 until OAM_ENTRY_SIZE) {
         val lastEntryStart = n - OAM_ENTRY_SIZE
@@ -195,7 +244,7 @@ fun findOamAnchors(bytes: ByteArray, minRun: Int = 12, yFloor: Int = 0xF0): List
         var runLen = 0
 
         fun flush() {
-            if (runLen >= minRun && (prevKey and 0xFF) >= yFloor) {
+            if (runLen >= minRun && (prevKey and 0xFF) >= yFloor && !isSolidFill(prevKey)) {
                 // Confidence scales with run length relative to a full 64-entry
                 // OAM table (55/64 in the reference capture) — a longer run is
                 // rarer to see by chance and closer to "this really is OAM".

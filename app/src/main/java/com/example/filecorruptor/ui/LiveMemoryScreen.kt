@@ -804,14 +804,16 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         Text("Scan for NES RAM Signatures (palette/OAM)")
                     }
                     Text(
-                        "Looks for the actual byte-level shape of real NES palette RAM (32 bytes, " +
-                            "every one <= 0x3F — the PPU's hardware 6-bit color limit) and sprite/OAM " +
-                            "RAM (a long run of one repeated, off-screen-parked sprite entry) — shapes " +
-                            "confirmed by parsing a real FCEUX save state, not guessed. Both are far " +
-                            "rarer to see by accident than a region merely being the right size, so a " +
-                            "hit is a strong lead even before running an activity scan — though it's " +
-                            "still worth confirming with one, since a static match can't be 100% certain " +
-                            "on its own. Works on a static/paused frame; doesn't need gameplay happening.",
+                        "Looks for the byte-level shape of real NES sprite/OAM RAM (a long run of " +
+                            "one repeated, off-screen-parked sprite entry, excluding solid fills like " +
+                            "0xFF — that's an allocator poison pattern, not a game) and, as a much " +
+                            "weaker secondary signal, palette RAM (32 bytes all <= 0x3F). Sprite/OAM " +
+                            "hits are the strong lead here; palette hits are common in ordinary memory " +
+                            "too (real memory is full of small numbers — counters, flags, indices — " +
+                            "so \"32 bytes <= 0x3F\" isn't the rare event it sounds like) and should be " +
+                            "read as \"possible\", not \"likely\", on their own. Either way, confirm with " +
+                            "an activity scan before trusting it. Works on a paused frame — doesn't need " +
+                            "gameplay happening.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1073,8 +1075,8 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             Column(Modifier.padding(8.dp)) {
                                 nesHits.sortedByDescending { it.confidence }.forEach { hit ->
                                     val kindLabel = when (hit.kind) {
-                                        NesAnchorKind.PALETTE_RAM -> "Palette RAM shape"
-                                        NesAnchorKind.SPRITE_OAM -> "Sprite/OAM shape"
+                                        NesAnchorKind.PALETTE_RAM -> "Palette RAM shape (weak signal)"
+                                        NesAnchorKind.SPRITE_OAM -> "Sprite/OAM shape (strong signal)"
                                     }
                                     ListItem(
                                         headlineContent = {
