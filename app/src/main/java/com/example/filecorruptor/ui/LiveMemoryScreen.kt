@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -19,14 +20,17 @@ import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.io.File
 import com.example.filecorruptor.engine.CorruptionEngineExecutor
@@ -311,6 +315,42 @@ private fun formatSize(bytes: Long): String = when {
     else -> "$bytes B"
 }
 
+/**
+ * Classic hex-editor-style dump: offset, hex bytes, and a printable-ASCII
+ * column side by side — the point being to actually look at what's in a
+ * candidate region or window before committing to it. Real console memory
+ * often gives itself away this way: NES/SNES-era tile and nametable data
+ * (plain arrays like uint8_t vram[2048] in most cores, not malloc'd) tends
+ * to show visibly repeating small values, where a pointer-heavy structure
+ * would look comparatively patternless, and readable strings show up as
+ * plain text in the ASCII column if there are any nearby (level names,
+ * debug strings, etc). Capped in length since this is for a quick look,
+ * not a full binary export.
+ */
+private fun hexDump(bytes: ByteArray, baseOffset: Int = 0, maxBytes: Int = 512): String {
+    val shown = bytes.take(maxBytes)
+    val bytesPerLine = 16
+    val sb = StringBuilder()
+    var i = 0
+    while (i < shown.size) {
+        val line = shown.subList(i, minOf(i + bytesPerLine, shown.size))
+        val hex = line.joinToString(" ") { "%02X".format(it) }
+        val ascii = line.joinToString("") { b ->
+            val c = b.toInt() and 0xFF
+            if (c in 32..126) c.toChar().toString() else "."
+        }
+        sb.append("%06X".format(baseOffset + i))
+            .append("  ")
+            .append(hex.padEnd(bytesPerLine * 3 - 1))
+            .append("  |")
+            .append(ascii)
+            .append("|\n")
+        i += bytesPerLine
+    }
+    if (bytes.size > maxBytes) sb.append("… (${bytes.size - maxBytes} more bytes not shown)")
+    return sb.toString().trimEnd()
+}
+
 @Composable
 fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     val context = LocalContext.current
@@ -351,6 +391,9 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     var analysisProgress by remember { mutableStateOf(0 to 0) }
     var analysisSamples by remember { mutableStateOf(8f) }
     var targetSizeText by remember { mutableStateOf("") }
+    var previewLabel by remember { mutableStateOf<String?>(null) }
+    var previewText by remember { mutableStateOf<String?>(null) }
+    var previewLoading by remember { mutableStateOf(false) }
 
     var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
@@ -818,6 +861,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                             ) {
                                                 Icon(Icons.Filled.Insights, contentDescription = "Analyze activity in this region")
                                             }
+                                            IconButton(
+                                                onClick = {
+                                                    previewLabel = "First bytes of ${formatSize(region.size)} region at 0x${region.start.toString(16)}"
+                                                    previewText = null
+                                                    previewLoading = true
+                                                    scope.launch {
+                                                        val bytes = withContext(Dispatchers.IO) {
+                                                            RootMemoryHelper.readMemory(context, proc.pid, region.start, minOf(region.size, 512).toInt())
+                                                        }
+                                                        previewLoading = false
+                                                        previewText = if (bytes != null) hexDump(bytes) else "Could not read this region — it may have moved or the process may be gone."
+                                                    }
+                                                },
+                                                enabled = !previewLoading
+                                            ) {
+                                                Icon(Icons.Filled.Visibility, contentDescription = "Preview bytes as hex/ASCII")
+                                            }
                                         }
                                     },
                                     modifier = Modifier.clickable {
@@ -931,24 +991,68 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         },
                                         supportingContent = { Text("Changed ${w.changeScore} time(s) across the samples") },
                                         trailingContent = {
-                                            TextButton(onClick = {
-                                                val target = CorruptionTarget(proc, expandedRegion)
-                                                if (targets.none { it.process.pid == proc.pid && it.region == expandedRegion }) {
-                                                    targets = targets + target
-                                                }
-                                                val eng = engine
-                                                if (eng != null) {
-                                                    val values = engineViewModel.valuesFor(eng.id)
-                                                    if (values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
-                                                        values["rangeStart"] = ParamValue.of(w.offsetStart.toString())
-                                                        values["rangeEnd"] = ParamValue.of(w.offsetEnd.toString())
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                IconButton(onClick = {
+                                                    previewLabel = "0x${w.offsetStart.toString(16)} - 0x${w.offsetEnd.toString(16)} in ${formatSize(expandedRegion.size)} region"
+                                                    previewText = null
+                                                    previewLoading = true
+                                                    scope.launch {
+                                                        val bytes = withContext(Dispatchers.IO) {
+                                                            RootMemoryHelper.readMemory(
+                                                                context, proc.pid,
+                                                                expandedRegion.start + w.offsetStart,
+                                                                minOf(w.size, 512)
+                                                            )
+                                                        }
+                                                        previewLoading = false
+                                                        previewText = if (bytes != null) hexDump(bytes, baseOffset = w.offsetStart)
+                                                        else "Could not read this span — it may have moved or the process may be gone."
                                                     }
+                                                }) {
+                                                    Icon(Icons.Filled.Visibility, contentDescription = "Preview bytes as hex/ASCII")
                                                 }
-                                            }) { Text("Use range") }
+                                                TextButton(onClick = {
+                                                    val target = CorruptionTarget(proc, expandedRegion)
+                                                    if (targets.none { it.process.pid == proc.pid && it.region == expandedRegion }) {
+                                                        targets = targets + target
+                                                    }
+                                                    val eng = engine
+                                                    if (eng != null) {
+                                                        val values = engineViewModel.valuesFor(eng.id)
+                                                        if (values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
+                                                            values["rangeStart"] = ParamValue.of(w.offsetStart.toString())
+                                                            values["rangeEnd"] = ParamValue.of(w.offsetEnd.toString())
+                                                        }
+                                                    }
+                                                }) { Text("Use range") }
+                                            }
                                         }
                                     )
                                 }
                             }
+                        }
+                    }
+                }
+
+                if (previewLoading || previewText != null) {
+                    Text("Byte Preview", style = MaterialTheme.typography.titleMedium)
+                    previewLabel?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (previewLoading) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Card {
+                            Text(
+                                previewText.orEmpty(),
+                                modifier = Modifier
+                                    .padding(12.dp)
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                softWrap = false
+                            )
                         }
                     }
                 }
