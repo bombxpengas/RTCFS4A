@@ -5,6 +5,9 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -18,6 +21,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Eco
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
@@ -38,11 +42,12 @@ import com.example.filecorruptor.engine.CorruptionEngineExecutor
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.engine.ParamValue
 import com.example.filecorruptor.engine.isVisible
-import com.example.filecorruptor.livemem.LiveCorruptor
+import com.example.filecorruptor.livemem.LiveSession
+import com.example.filecorruptor.livemem.LiveTarget
 import com.example.filecorruptor.livemem.LiveProcess
 import com.example.filecorruptor.livemem.MemoryRegion
 import com.example.filecorruptor.log.RtcLog
-import com.example.filecorruptor.safety.AntiCrash
+import com.example.filecorruptor.overlay.OverlayService
 import com.example.filecorruptor.livemem.NesAnchorHit
 import com.example.filecorruptor.livemem.NesAnchorKind
 import com.example.filecorruptor.livemem.RootMemoryHelper
@@ -322,7 +327,14 @@ private suspend fun analyzeAllRegionsActivity(
     return regions.associateWith { region -> windowsFromChangeCounts(changeCountsByRegion.getValue(region)) }
 }
 
-private data class CorruptionTarget(val process: LiveProcess, val region: MemoryRegion)
+// Shared with the floating overlay (see LiveSession): the targets live in the session, not in this screen.
+private typealias CorruptionTarget = LiveTarget
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
 
 private fun formatSize(bytes: Long): String = when {
     bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
@@ -395,7 +407,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     // Accumulated across possibly several processes — pick a process, scan
     // it, add one or more regions, then switch process and add more. Every
     // added target gets corrupted together each cycle.
-    var targets by remember { mutableStateOf<List<CorruptionTarget>>(emptyList()) }
+    var targets by remember { mutableStateOf<List<CorruptionTarget>>(LiveSession.targets) }
 
     // Activity-scan state, shared by both the per-region and "analyze
     // everything" flows — every measured region's result lands in the same
@@ -418,13 +430,30 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     var previewText by remember { mutableStateOf<String?>(null) }
     var previewLoading by remember { mutableStateOf(false) }
 
-    var isBusy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
     var isErrorStatus by remember { mutableStateOf(false) }
 
-    var liveRunning by remember { mutableStateOf(false) }
-    var tickIntervalMs by remember { mutableStateOf(250f) }
-    var tickCount by remember { mutableStateOf(0) }
+    // The live loop, tick speed and Corrupt-Once live in LiveSession so the floating
+    // overlay can drive them while this screen is hidden; this screen is just one view of it.
+    val session by LiveSession.state.collectAsState()
+    val liveRunning = session.running
+    val tickCount = session.ticks
+    val sessionTargets by LiveSession.targetsFlow.collectAsState()
+    var overlayNotice by remember { mutableStateOf<String?>(null) }
+
+    // targets: screen -> session when the user edits them; session -> screen when it drops a dead one.
+    LaunchedEffect(targets) { LiveSession.setTargets(targets) }
+    LaunchedEffect(sessionTargets) { if (sessionTargets != targets) targets = sessionTargets }
+    SideEffect {
+        LiveSession.setEngine(context, engine, engine?.let { engineViewModel.valuesFor(it.id) })
+    }
+    // Results coming from the session (also when triggered from the overlay) show up in the status card.
+    LaunchedEffect(session.messageSeq) {
+        session.message?.let {
+            statusMessage = it
+            isErrorStatus = session.isError
+        }
+    }
 
     LaunchedEffect(Unit) {
         rootAvailable = withContext(Dispatchers.IO) { RootMemoryHelper.hasRoot() }
@@ -432,9 +461,10 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     }
 
     // Stop any live-corrupt loop the moment you leave this tab, rather than
-    // letting it keep running against a screen you can no longer see or stop.
+    // letting it keep running against a screen you can no longer see or stop —
+    // unless the floating overlay is up, which *is* a way to see and stop it.
     DisposableEffect(Unit) {
-        onDispose { liveRunning = false }
+        onDispose { if (!OverlayService.isRunning) LiveSession.stop() }
     }
 
     Column(
@@ -453,6 +483,33 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        // Minimized mode: shrink the app into a floating control window over the emulator,
+        // so no split-screen / freeform window is needed.
+        OutlinedButton(
+            onClick = {
+                scope.launch {
+                    val allowed = withContext(Dispatchers.IO) { OverlayService.ensurePermission(context) }
+                    if (allowed) {
+                        overlayNotice = null
+                        OverlayService.start(context)
+                        context.findActivity()?.moveTaskToBack(true)
+                    } else {
+                        overlayNotice = "Allow \"Display over other apps\" for this app in the screen that just opened, " +
+                            "then tap Minimize again."
+                        context.startActivity(OverlayService.permissionSettingsIntent(context))
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.PictureInPictureAlt, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("Minimize to floating overlay")
+        }
+        overlayNotice?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        }
 
         if (!rootChecked) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -725,6 +782,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             val toScan = visibleRegions
                             analysisRunning = true
                             analysisProgress = 0 to analysisSamples.toInt()
+                            LiveSession.setProgress("Activity scan", 0, analysisSamples.toInt())
                             scope.launch {
                                 val outcome = withContext(Dispatchers.IO) {
                                     runCatching {
@@ -732,10 +790,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                             context, proc.pid, toScan,
                                             samples = analysisSamples.toInt().coerceAtLeast(2),
                                             intervalMs = 150L
-                                        ) { done, total -> analysisProgress = done to total }
+                                        ) { done, total ->
+                                            analysisProgress = done to total
+                                            LiveSession.setProgress("Activity scan", done, total)
+                                        }
                                     }
                                 }
                                 analysisRunning = false
+                                LiveSession.clearProgress()
                                 outcome.onSuccess { result ->
                                     regionActivity = regionActivity + result
                                     expandedActivityRegion = result.maxByOrNull { it.value.totalScore }?.key
@@ -770,6 +832,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         onClick = {
                             val toScan = visibleRegions
                             nesAnchorScanRunning = true
+                            LiveSession.setProgress("NES signature scan", 0, 0)
                             scope.launch {
                                 val results = withContext(Dispatchers.IO) {
                                     val out = mutableMapOf<MemoryRegion, List<NesAnchorHit>>()
@@ -788,6 +851,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                     out
                                 }
                                 nesAnchorScanRunning = false
+                                LiveSession.clearProgress()
                                 nesAnchorResults = results
                                 if (results.isEmpty()) {
                                     isErrorStatus = false
@@ -942,6 +1006,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                     expandedActivityRegion = region
                                                     analysisRunning = true
                                                     analysisProgress = 0 to analysisSamples.toInt()
+                                                    LiveSession.setProgress("Activity scan", 0, analysisSamples.toInt())
                                                     scope.launch {
                                                         val outcome = withContext(Dispatchers.IO) {
                                                             runCatching {
@@ -949,10 +1014,14 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                                     context, proc.pid, region,
                                                                     samples = analysisSamples.toInt().coerceAtLeast(2),
                                                                     intervalMs = 150L
-                                                                ) { done, total -> analysisProgress = done to total }
+                                                                ) { done, total ->
+                                                                    analysisProgress = done to total
+                                                                    LiveSession.setProgress("Activity scan", done, total)
+                                                                }
                                                             }
                                                         }
                                                         analysisRunning = false
+                                                        LiveSession.clearProgress()
                                                         outcome.onSuccess { result ->
                                                             regionActivity = regionActivity + (region to result)
                                                         }.onFailure { e ->
@@ -1311,74 +1380,12 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     }
                 }
 
-                // One target's failure (OOM on a huge region, process exited,
-                // etc.) never stops the others — each is fully independent,
-                // same as batch file corruption tallies successes/failures
-                // instead of aborting the whole run on the first problem.
-                // The read → corrupt → guard → write pipeline (and its anti-crash
-                // rules, crash detection and logging) lives in LiveCorruptor.
-                suspend fun corruptOneTarget(target: CorruptionTarget, values: Map<String, ParamValue>): Result<Long> =
-                    runCatching {
-                        LiveCorruptor.corruptTarget(context, target.process, target.region, engine, values).seedUsed
-                    }
-
-                // A target whose process died is useless from then on: its pid is
-                // gone and a relaunch gets new addresses. Drop it so the loop keeps
-                // going for the others (or stops, per the "stop on crash" setting).
-                fun dropDeadTargets(deadPids: Set<Int>) {
-                    if (deadPids.isNotEmpty()) targets = targets.filterNot { it.process.pid in deadPids }
-                }
-
-                fun runOneCycle(onDone: (succeeded: Int, failed: Int, lastError: String?) -> Unit) {
-                    val currentTargets = targets
-                    scope.launch {
-                        var succeeded = 0
-                        var failed = 0
-                        var lastError: String? = null
-                        var lastSeed: Long? = null
-                        val deadPids = mutableSetOf<Int>()
-                        withContext(Dispatchers.IO) {
-                            for (target in currentTargets) {
-                                corruptOneTarget(target, currentValues)
-                                    .onSuccess { seed -> succeeded++; lastSeed = seed }
-                                    .onFailure { e ->
-                                        failed++
-                                        if (e is LiveCorruptor.TargetDiedException) deadPids += target.process.pid
-                                        lastError = if (e is OutOfMemoryError) {
-                                            "Out of memory on ${target.process.name} (${formatSize(target.region.size)}) — too large to hold twice at once."
-                                        } else if (e is LiveCorruptor.TargetDiedException) {
-                                            "${e.message} — details in the Logs tab."
-                                        } else {
-                                            e.message
-                                        }
-                                        RtcLog.w("Live", "corrupt-once failed: ${e.message}")
-                                    }
-                            }
-                        }
-                        dropDeadTargets(deadPids)
-                        lastSeed?.let { seed ->
-                            if (engineValues.containsKey("lastSeedUsed")) {
-                                engineValues["lastSeedUsed"] = ParamValue.of(seed.toString())
-                            }
-                        }
-                        onDone(succeeded, failed, lastError)
-                    }
-                }
-
+                // The read -> corrupt -> guard -> write pipeline, the live loop, crash
+                // detection and logging all live in LiveSession / LiveCorruptor, so the
+                // floating overlay can run exactly the same thing.
                 Button(
-                    onClick = {
-                        isBusy = true
-                        runOneCycle { succeeded, failed, lastError ->
-                            isBusy = false
-                            isErrorStatus = failed > 0
-                            statusMessage = when {
-                                failed == 0 -> "Corrupted all $succeeded target(s) once."
-                                succeeded == 0 -> lastError ?: "All $failed target(s) failed."
-                                else -> "Corrupted $succeeded, failed $failed" + (lastError?.let { " — $it" } ?: "")
-                            }
-                        }
-                    },
-                    enabled = !isBusy && !liveRunning,
+                    onClick = { LiveSession.corruptOnce() },
+                    enabled = !session.busy && !liveRunning,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Filled.Bolt, contentDescription = null)
@@ -1403,96 +1410,24 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     }
                     Switch(
                         checked = liveRunning,
-                        onCheckedChange = {
-                            liveRunning = it
-                            if (it) tickCount = 0
-                            RtcLog.i(
-                                "Live",
-                                "live corrupting ${if (it) "STARTED" else "stopped"}: engine=${engine.id} " +
-                                    "targets=${targets.size} tick=${tickIntervalMs.toInt()}ms"
-                            )
-                            if (it) {
-                                val params = engineValues.entries.joinToString(", ") { e -> "${e.key}=${e.value.raw}" }.take(600)
-                                RtcLog.i("Live", "params=[$params]")
-                                targets.forEach { t ->
-                                    RtcLog.i(
-                                        "Live",
-                                        "target ${t.process.name} pid=${t.process.pid} " +
-                                            "0x${t.region.start.toString(16)}-0x${t.region.end.toString(16)} " +
-                                            "${t.region.perms} ${t.region.path}"
-                                    )
-                                }
-                            }
-                        }
+                        onCheckedChange = { if (it) LiveSession.start() else LiveSession.stop() }
                     )
                 }
 
                 Column {
                     Text(
-                        "Tick every ${tickIntervalMs.toInt()} ms",
+                        "Tick every ${session.tickIntervalMs} ms",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Slider(
-                        value = tickIntervalMs,
-                        onValueChange = { tickIntervalMs = it },
-                        valueRange = 50f..2000f,
-                        enabled = !liveRunning
+                        value = session.tickIntervalMs.toFloat(),
+                        onValueChange = { LiveSession.setTickInterval(it.toInt()) },
+                        valueRange = 50f..2000f
                     )
                 }
 
                 if (liveRunning) {
-                    LaunchedEffect(liveRunning, targets, engine.id, tickIntervalMs) {
-                        while (liveRunning) {
-                            if (targets.isEmpty()) {
-                                liveRunning = false
-                                break
-                            }
-                            var anySucceeded = false
-                            var anyFailed = false
-                            var lastError: String? = null
-                            val deadPids = mutableSetOf<Int>()
-                            withContext(Dispatchers.IO) {
-                                for (target in targets) {
-                                    // Same OOM-safety reasoning as Corrupt Once —
-                                    // one bad target must not crash the loop or
-                                    // stop the other targets from still ticking.
-                                    corruptOneTarget(target, engineValues.toMap())
-                                        .onSuccess { anySucceeded = true }
-                                        .onFailure { e ->
-                                            anyFailed = true
-                                            if (e is LiveCorruptor.TargetDiedException) deadPids += target.process.pid
-                                            lastError = if (e is OutOfMemoryError) {
-                                                "out of memory on ${target.process.name} (${formatSize(target.region.size)})"
-                                            } else {
-                                                e.message
-                                            }
-                                        }
-                                }
-                            }
-                            if (deadPids.isNotEmpty()) {
-                                dropDeadTargets(deadPids)
-                                // Stop right away so we never keep hammering a relaunched
-                                // process (new pid, new addresses) with stale targets.
-                                if (AntiCrash.current().stopOnCrash || targets.isEmpty()) {
-                                    liveRunning = false
-                                    isErrorStatus = true
-                                    statusMessage = "Live corrupting stopped after $tickCount tick(s) — $lastError. Details in the Logs tab."
-                                    RtcLog.e("Live", "stopped after $tickCount tick(s): target died — $lastError")
-                                    break
-                                }
-                            }
-                            if (!anySucceeded && anyFailed) {
-                                liveRunning = false
-                                isErrorStatus = true
-                                statusMessage = "Live corrupting stopped — $lastError"
-                                RtcLog.w("Live", "stopped after $tickCount tick(s): every target failed — $lastError")
-                                break
-                            }
-                            tickCount++
-                            delay(tickIntervalMs.toLong())
-                        }
-                    }
                     Text(
                         "Ticks: $tickCount",
                         style = MaterialTheme.typography.bodyMedium,
