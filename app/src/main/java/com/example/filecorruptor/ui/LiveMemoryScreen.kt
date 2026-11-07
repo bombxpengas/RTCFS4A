@@ -38,8 +38,11 @@ import com.example.filecorruptor.engine.CorruptionEngineExecutor
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.engine.ParamValue
 import com.example.filecorruptor.engine.isVisible
+import com.example.filecorruptor.livemem.LiveCorruptor
 import com.example.filecorruptor.livemem.LiveProcess
 import com.example.filecorruptor.livemem.MemoryRegion
+import com.example.filecorruptor.log.RtcLog
+import com.example.filecorruptor.safety.AntiCrash
 import com.example.filecorruptor.livemem.NesAnchorHit
 import com.example.filecorruptor.livemem.NesAnchorKind
 import com.example.filecorruptor.livemem.RootMemoryHelper
@@ -73,7 +76,13 @@ import kotlinx.coroutines.withContext
  *  region that mattered for a core built this way. */
 private val NOISY_PATH_MARKERS = listOf(
     "dalvik", "/apex/", "/system/", "/vendor/", ".dex", ".vdex", ".odex", ".oat", ".art",
-    "/dev/", "[vdso]", "[vvar]", "[vsyscall]", "[stack", "jit-cache", "/data/dalvik-cache", "/linker"
+    "/dev/", "[vdso]", "[vvar]", "[vsyscall]", "[stack", "jit-cache", "/data/dalvik-cache", "/linker",
+    // Anti-crash additions: runtime/allocator/loader bookkeeping that is never
+    // "game data" and aborts the process the moment it is corrupted
+    // (bionic's stack+TLS blocks, the CFI shadow, the linker's own allocator,
+    // GWP-ASan guard pages, system-property and atexit tables, signal stacks).
+    "[anon:stack_and_tls", "[anon:cfi", "[anon:linker_alloc", "[anon:gwp", "[anon:system property",
+    "[anon:atexit", "[anon:thread signal stack", "[anon:bionic_alloc", "[anon:art"
 )
 
 private fun looksLikeNoise(region: MemoryRegion): Boolean {
@@ -1306,16 +1315,19 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 // etc.) never stops the others — each is fully independent,
                 // same as batch file corruption tallies successes/failures
                 // instead of aborting the whole run on the first problem.
+                // The read → corrupt → guard → write pipeline (and its anti-crash
+                // rules, crash detection and logging) lives in LiveCorruptor.
                 suspend fun corruptOneTarget(target: CorruptionTarget, values: Map<String, ParamValue>): Result<Long> =
                     runCatching {
-                        val bytes = RootMemoryHelper.readMemory(context, target.process.pid, target.region.start, target.region.size.toInt())
-                            ?: error("could not read ${target.process.name}'s region — it may have moved or the process may be gone")
-                        val result = CorruptionEngineExecutor.runWithSeed(bytes, engine, values)
-                        if (!RootMemoryHelper.writeMemory(context, target.process.pid, target.region.start, result.bytes)) {
-                            error("write failed for ${target.process.name}")
-                        }
-                        result.seedUsed
+                        LiveCorruptor.corruptTarget(context, target.process, target.region, engine, values).seedUsed
                     }
+
+                // A target whose process died is useless from then on: its pid is
+                // gone and a relaunch gets new addresses. Drop it so the loop keeps
+                // going for the others (or stops, per the "stop on crash" setting).
+                fun dropDeadTargets(deadPids: Set<Int>) {
+                    if (deadPids.isNotEmpty()) targets = targets.filterNot { it.process.pid in deadPids }
+                }
 
                 fun runOneCycle(onDone: (succeeded: Int, failed: Int, lastError: String?) -> Unit) {
                     val currentTargets = targets
@@ -1324,20 +1336,26 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         var failed = 0
                         var lastError: String? = null
                         var lastSeed: Long? = null
+                        val deadPids = mutableSetOf<Int>()
                         withContext(Dispatchers.IO) {
                             for (target in currentTargets) {
                                 corruptOneTarget(target, currentValues)
                                     .onSuccess { seed -> succeeded++; lastSeed = seed }
                                     .onFailure { e ->
                                         failed++
+                                        if (e is LiveCorruptor.TargetDiedException) deadPids += target.process.pid
                                         lastError = if (e is OutOfMemoryError) {
                                             "Out of memory on ${target.process.name} (${formatSize(target.region.size)}) — too large to hold twice at once."
+                                        } else if (e is LiveCorruptor.TargetDiedException) {
+                                            "${e.message} — details in the Logs tab."
                                         } else {
                                             e.message
                                         }
+                                        RtcLog.w("Live", "corrupt-once failed: ${e.message}")
                                     }
                             }
                         }
+                        dropDeadTargets(deadPids)
                         lastSeed?.let { seed ->
                             if (engineValues.containsKey("lastSeedUsed")) {
                                 engineValues["lastSeedUsed"] = ParamValue.of(seed.toString())
@@ -1388,6 +1406,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         onCheckedChange = {
                             liveRunning = it
                             if (it) tickCount = 0
+                            RtcLog.i(
+                                "Live",
+                                "live corrupting ${if (it) "STARTED" else "stopped"}: engine=${engine.id} " +
+                                    "targets=${targets.size} tick=${tickIntervalMs.toInt()}ms"
+                            )
+                            if (it) {
+                                val params = engineValues.entries.joinToString(", ") { e -> "${e.key}=${e.value.raw}" }.take(600)
+                                RtcLog.i("Live", "params=[$params]")
+                                targets.forEach { t ->
+                                    RtcLog.i(
+                                        "Live",
+                                        "target ${t.process.name} pid=${t.process.pid} " +
+                                            "0x${t.region.start.toString(16)}-0x${t.region.end.toString(16)} " +
+                                            "${t.region.perms} ${t.region.path}"
+                                    )
+                                }
+                            }
                         }
                     )
                 }
@@ -1416,6 +1451,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             var anySucceeded = false
                             var anyFailed = false
                             var lastError: String? = null
+                            val deadPids = mutableSetOf<Int>()
                             withContext(Dispatchers.IO) {
                                 for (target in targets) {
                                     // Same OOM-safety reasoning as Corrupt Once —
@@ -1425,6 +1461,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         .onSuccess { anySucceeded = true }
                                         .onFailure { e ->
                                             anyFailed = true
+                                            if (e is LiveCorruptor.TargetDiedException) deadPids += target.process.pid
                                             lastError = if (e is OutOfMemoryError) {
                                                 "out of memory on ${target.process.name} (${formatSize(target.region.size)})"
                                             } else {
@@ -1433,10 +1470,23 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                         }
                                 }
                             }
+                            if (deadPids.isNotEmpty()) {
+                                dropDeadTargets(deadPids)
+                                // Stop right away so we never keep hammering a relaunched
+                                // process (new pid, new addresses) with stale targets.
+                                if (AntiCrash.current().stopOnCrash || targets.isEmpty()) {
+                                    liveRunning = false
+                                    isErrorStatus = true
+                                    statusMessage = "Live corrupting stopped after $tickCount tick(s) — $lastError. Details in the Logs tab."
+                                    RtcLog.e("Live", "stopped after $tickCount tick(s): target died — $lastError")
+                                    break
+                                }
+                            }
                             if (!anySucceeded && anyFailed) {
                                 liveRunning = false
                                 isErrorStatus = true
                                 statusMessage = "Live corrupting stopped — $lastError"
+                                RtcLog.w("Live", "stopped after $tickCount tick(s): every target failed — $lastError")
                                 break
                             }
                             tickCount++

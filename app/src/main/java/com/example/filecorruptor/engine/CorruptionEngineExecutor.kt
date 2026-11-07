@@ -1,5 +1,7 @@
 package com.example.filecorruptor.engine
 
+import com.example.filecorruptor.log.RtcLog
+import com.example.filecorruptor.safety.AntiCrash
 import kotlin.random.Random
 
 /**
@@ -22,7 +24,20 @@ object CorruptionEngineExecutor {
     fun run(input: ByteArray, engine: EngineDefinition, values: Map<String, ParamValue>): ByteArray =
         runWithSeed(input, engine, values).bytes
 
-    fun runWithSeed(input: ByteArray, engine: EngineDefinition, values: Map<String, ParamValue>): EngineRunResult {
+    /**
+     * [protectKnownHeaders]: for *files*, restore a recognized ROM/binary
+     * header (iNES, GBA, NDS, ...) after the engine ran, since corrupting it
+     * makes the loader reject the file instead of showing a glitch (see
+     * [AntiCrash.protectedHeaderRanges]). Live-RAM callers pass false — a
+     * process's memory isn't a file with a header — and do their own
+     * RAM-specific guarding in LiveCorruptor instead.
+     */
+    fun runWithSeed(
+        input: ByteArray,
+        engine: EngineDefinition,
+        values: Map<String, ParamValue>,
+        protectKnownHeaders: Boolean = true
+    ): EngineRunResult {
         if (input.isEmpty() || engine.operations.isEmpty()) return EngineRunResult(input, 0L)
         val output = input.copyOf()
 
@@ -44,7 +59,34 @@ object CorruptionEngineExecutor {
             if (op.enabledParam != null && values[op.enabledParam]?.asBoolean() != true) {
                 continue // this whole pass is switched off — e.g. "Enable byte corruption"
             }
-            applyOperation(output, op, values, random)
+            // One misbehaving pass (a bad custom-engine parameter, an index
+            // out of range, ...) must not take the whole app down or discard
+            // the other passes' work — log it with enough detail to reproduce
+            // and carry on with the next operation.
+            try {
+                applyOperation(output, op, values, random)
+            } catch (e: Exception) {
+                RtcLog.e("Engine", "operation '${op.type}' in engine '${engine.id}' threw and was skipped (seed=$actualSeed)", e)
+            }
+        }
+
+        var headerBytesRestored = 0
+        val cfg = AntiCrash.current()
+        if (protectKnownHeaders && cfg.enabled && cfg.protectFileHeaders) {
+            headerBytesRestored = AntiCrash.restoreProtectedHeaders(input, output)
+        }
+
+        if (protectKnownHeaders) {
+            // A file run is a deliberate, one-off action: log what it took to reproduce it.
+            val params = values.entries.joinToString(", ") { "${it.key}=${it.value.raw}" }.take(600)
+            RtcLog.i(
+                "Engine",
+                "engine=${engine.id} size=${input.size} seed=$actualSeed " +
+                    "headerBytesRestored=$headerBytesRestored params=[$params]"
+            )
+        } else {
+            // Live RAM runs this every tick — keep it out of the persistent log.
+            RtcLog.d("Engine", "engine=${engine.id} size=${input.size} seed=$actualSeed")
         }
         return EngineRunResult(output, actualSeed)
     }

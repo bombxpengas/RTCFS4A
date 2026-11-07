@@ -7,6 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -22,21 +23,29 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.filecorruptor.engine.EngineViewModel
 import com.example.filecorruptor.ui.CorruptorScreen
+import com.example.filecorruptor.log.RtcLog
+import com.example.filecorruptor.safety.AntiCrash
 import com.example.filecorruptor.ui.LiveMemoryScreen
+import com.example.filecorruptor.ui.LogsScreen
 import com.example.filecorruptor.ui.SettingsScreen
 import com.example.filecorruptor.ui.theme.FileCorruptorTheme
 
 private sealed class Destination(val route: String, val label: String) {
     data object Corruptor : Destination("corruptor", "Corruptor")
     data object LiveMemory : Destination("live", "Live RAM")
+    data object Logs : Destination("logs", "Logs")
     data object Settings : Destination("settings", "Settings")
 }
 
-private val destinations = listOf(Destination.Corruptor, Destination.LiveMemory, Destination.Settings)
+private val destinations = listOf(Destination.Corruptor, Destination.LiveMemory, Destination.Logs, Destination.Settings)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Logger first (it also installs the uncaught-exception hook), then the
+        // anti-crash settings, so everything after this point is on record.
+        RtcLog.init(applicationContext)
+        AntiCrash.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             FileCorruptorTheme {
@@ -83,6 +92,7 @@ private fun AppRoot() {
                                 when (dest) {
                                     is Destination.Corruptor -> Icons.Filled.BrokenImage
                                     is Destination.LiveMemory -> Icons.Filled.Memory
+                                    is Destination.Logs -> Icons.Filled.BugReport
                                     is Destination.Settings -> Icons.Filled.Settings
                                 },
                                 contentDescription = dest.label
@@ -101,6 +111,7 @@ private fun AppRoot() {
         ) {
             composable(Destination.Corruptor.route) { CorruptorScreen(engineViewModel) }
             composable(Destination.LiveMemory.route) { LiveMemoryScreen(engineViewModel) }
+            composable(Destination.Logs.route) { LogsScreen() }
             composable(Destination.Settings.route) { SettingsScreen(engineViewModel) }
         }
     }
