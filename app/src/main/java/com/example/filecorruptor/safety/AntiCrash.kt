@@ -293,6 +293,62 @@ object AntiCrash {
         return protectedWords
     }
 
+    private fun readLongLe(b: ByteArray, i: Int): Long {
+        var v = 0L
+        for (k in 7 downTo 0) v = (v shl 8) or (b[i + k].toLong() and 0xFF)
+        return v
+    }
+
+    /**
+     * Null-slot guard. The pointer shield only protects words that *already are* pointers. A
+     * crash in the logs (SIGSEGV in the GL driver, fault addr 0xa833000000000008) was the opposite:
+     * an 8-byte slot that held NULL had its top bytes overwritten, so the driver's `if (p)` check
+     * passed and it dereferenced garbage. A null slot sitting in a struct that also holds real
+     * pointers is almost certainly an optional pointer — so if the corruption turned it into a
+     * wild, non-pointer, non-small value, put the zero back. Only applies inside 64-byte lines
+     * that contain at least one real pointer, so plain zeroed data stays fully corruptible.
+     * Returns the number of slots restored.
+     */
+    fun shieldNullSlots(original: ByteArray, corrupted: ByteArray, maps: MapIndex): Int {
+        if (maps.isEmpty || !maps.is64Bit) return 0
+        val n = minOf(original.size, corrupted.size)
+        var restored = 0
+        var lineIdx = -1
+        var lineHasPointer = false
+        var i = 0
+        while (i + 8 <= n) {
+            var differs = false
+            for (k in 0 until 8) {
+                if (original[i + k] != corrupted[i + k]) { differs = true; break }
+            }
+            if (differs && readLongLe(original, i) == 0L) {
+                val cv = readLongLe(corrupted, i)
+                val masked = cv and 0x00FFFFFFFFFFFFFFL
+                val wild = (masked ushr 40) != 0L && !maps.contains(masked)
+                if (wild) {
+                    val line = i ushr 6
+                    if (line != lineIdx) {
+                        lineIdx = line
+                        lineHasPointer = false
+                        val from = line shl 6
+                        var j = from
+                        while (j + 8 <= minOf(from + 64, n)) {
+                            val ov = readLongLe(original, j) and 0x00FFFFFFFFFFFFFFL
+                            if (ov != 0L && maps.contains(ov)) { lineHasPointer = true; break }
+                            j += 8
+                        }
+                    }
+                    if (lineHasPointer) {
+                        System.arraycopy(original, i, corrupted, i, 8)
+                        restored++
+                    }
+                }
+            }
+            i += 8
+        }
+        return restored
+    }
+
     // ------------------------------------------------------------------
     // RAM: minimal patches
     // ------------------------------------------------------------------
@@ -361,11 +417,13 @@ object AntiCrash {
         region.path.isNotEmpty() && !region.path.startsWith("[")
 
     /** Remember which areas this cycle touched, so a crash right after can be attributed. */
-    fun recordCycle(key: String, patches: List<Patch>) {
+    fun recordCycle(key: String, patches: List<Patch>, baseOffset: Long = 0L) {
         if (patches.isEmpty()) return
         val buckets = HashSet<Int>()
         for (p in patches) {
-            for (b in (p.offset / BUCKET)..((p.offset + p.bytes.size - 1) / BUCKET)) buckets += b
+            val lo = ((baseOffset + p.offset) / BUCKET).toInt()
+            val hi = ((baseOffset + p.offset + p.bytes.size - 1) / BUCKET).toInt()
+            for (b in lo..hi) buckets += b
         }
         synchronized(quarantineLock) {
             val ring = recentCycles.getOrPut(key) { ArrayDeque() }
@@ -378,7 +436,7 @@ object AntiCrash {
      * Put back the original bytes in every quarantined area of [corrupted].
      * Returns how many bytes were restored.
      */
-    fun applyQuarantine(key: String, original: ByteArray, corrupted: ByteArray): Int {
+    fun applyQuarantine(key: String, original: ByteArray, corrupted: ByteArray, baseOffset: Long = 0L): Int {
         val bad: List<Int> = synchronized(quarantineLock) {
             strikes[key]?.filterValues { it >= QUARANTINE_THRESHOLD }?.keys?.toList().orEmpty()
         }
@@ -386,10 +444,12 @@ object AntiCrash {
         var restored = 0
         val n = minOf(original.size, corrupted.size)
         for (b in bad) {
-            val lo = b.toLong() * BUCKET
-            if (lo >= n) continue
+            // Buckets are numbered from the region start; the buffer may be a window starting at baseOffset.
+            val lo = b.toLong() * BUCKET - baseOffset
+            if (lo >= n || lo + BUCKET <= 0) continue
+            val from = maxOf(lo, 0L).toInt()
             val hi = minOf(lo + BUCKET, n.toLong()).toInt()
-            for (i in lo.toInt() until hi) {
+            for (i in from until hi) {
                 if (corrupted[i] != original[i]) {
                     corrupted[i] = original[i]
                     restored++

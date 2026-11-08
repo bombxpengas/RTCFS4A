@@ -2,7 +2,10 @@ package com.example.filecorruptor.livemem
 
 import android.content.Context
 import com.example.filecorruptor.log.RtcLog
+import java.io.BufferedInputStream
+import java.io.DataInputStream
 import java.io.File
+import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
@@ -214,6 +217,64 @@ object RootMemoryHelper {
 
     /** Like [readMemory], but also returns the helper's error text on failure. */
     fun readMemoryResult(context: Context, pid: Int, address: Long, length: Int): Pair<ByteArray?, String?> {
+        // Preferred: stream the bytes straight from the helper's stdout. The file route below writes the
+        // whole region to flash storage and reads it back — for an 80 MB region on a 50 ms tick that is
+        // gigabytes of pointless writes and a big reason other apps stutter.
+        val streamed = readViaPipe(context, pid, address, length)
+        if (streamed.first != null) return streamed
+        val err = streamed.second.orEmpty()
+        if (!err.startsWith(PIPE_UNSUPPORTED)) return streamed // a real error (unreadable/unmapped), not a transport problem
+        return readViaFile(context, pid, address, length)
+    }
+
+    private const val PIPE_UNSUPPORTED = "pipe transport unavailable"
+
+    private fun readViaPipe(context: Context, pid: Int, address: Long, length: Int): Pair<ByteArray?, String?> {
+        val command = buildCommand(context, listOf("readbin", pid.toString(), address.toString(16), length.toString()))
+        var process: Process? = null
+        try {
+            process = ProcessBuilder("su", "-c", command).redirectErrorStream(false).start()
+            val p = process
+            // Drain stderr so a chatty su can never fill its pipe and deadlock us.
+            Thread { try { val sink = ByteArray(4096); p.errorStream.use { while (it.read(sink) >= 0) { /* discard */ } } } catch (_: Exception) {} }
+                .apply { isDaemon = true }.start()
+            val watchdog = Thread {
+                try { Thread.sleep(DEFAULT_TIMEOUT_MS) ; if (p.isAlive) p.destroyForcibly() } catch (_: InterruptedException) {}
+            }.apply { isDaemon = true; start() }
+            try {
+                val input = BufferedInputStream(p.inputStream, 64 * 1024)
+                val head = StringBuilder()
+                while (head.length < 200) {
+                    val b = input.read()
+                    if (b < 0) return null to "$PIPE_UNSUPPORTED (no output)"
+                    if (b == '\n'.code) break
+                    head.append(b.toChar())
+                }
+                val line = head.toString().trim()
+                if (line.startsWith("ERR unknown command")) return null to "$PIPE_UNSUPPORTED (old helper)"
+                if (line.startsWith("ERR")) return null to line
+                if (line != "DATA $length") return null to "$PIPE_UNSUPPORTED (unexpected header '${line.take(60)}')"
+                val out = try { ByteArray(length) } catch (_: OutOfMemoryError) {
+                    return null to "out of memory allocating ${length / 1_048_576} MB"
+                }
+                var done = 0
+                while (done < length) {
+                    val n = input.read(out, done, length - done)
+                    if (n < 0) return null to "$PIPE_UNSUPPORTED (stream ended after $done of $length bytes)"
+                    done += n
+                }
+                return out to null
+            } finally {
+                watchdog.interrupt()
+            }
+        } catch (e: Exception) {
+            return null to "$PIPE_UNSUPPORTED (${e.message})"
+        } finally {
+            process?.let { if (it.isAlive) it.destroyForcibly() }
+        }
+    }
+
+    private fun readViaFile(context: Context, pid: Int, address: Long, length: Int): Pair<ByteArray?, String?> {
         val outFile = File(context.cacheDir, "rtmem_read_${System.nanoTime()}.bin")
         val result = runAsRoot(
             context, "read", pid.toString(), address.toString(16), length.toString(), outFile.absolutePath
@@ -332,4 +393,114 @@ object RootMemoryHelper {
             inFile.delete()
         }
     }
+
+    // ------------------------------------------------------------------
+    // Bounded-memory activity scan (native; see `activity` in rtmem_helper.c)
+    // ------------------------------------------------------------------
+
+    /**
+     * Change counters for one region. [granule] bytes share one counter (1 = byte-exact);
+     * [counts] is null if the region didn't fit the memory budget even at the coarsest granule.
+     * Counters are unsigned bytes (saturate at 255).
+     */
+    class ActivityRegionResult(val region: MemoryRegion, val granule: Int, val counts: ByteArray?)
+
+    class ActivityScanOutcome(val results: List<ActivityRegionResult>, val cancelled: Boolean)
+
+    /**
+     * Samples [regions] of [pid] [samples] times, [intervalMs] apart, entirely inside the native
+     * helper (which keeps ~[budgetMb] MB of state in total, runs niced, and never stops the target),
+     * and returns per-region change counters. [onProgress] gets (done, total) after each sample;
+     * [isCancelled] is polled with every progress line. Blocking — call from Dispatchers.IO.
+     */
+    fun activityScan(
+        context: Context,
+        pid: Int,
+        regions: List<MemoryRegion>,
+        samples: Int,
+        intervalMs: Long,
+        budgetMb: Int,
+        onProgress: (done: Int, total: Int) -> Unit,
+        isCancelled: () -> Boolean
+    ): ActivityScanOutcome {
+        require(regions.isNotEmpty()) { "no regions to scan" }
+        val tag = System.nanoTime()
+        val regionsFile = File(context.cacheDir, "rtmem_act_regions_$tag.txt")
+        val outFile = File(context.cacheDir, "rtmem_act_out_$tag.bin")
+        val cancelFile = File(context.cacheDir, "rtmem_act_cancel_$tag")
+        try {
+            regionsFile.writeText(regions.joinToString("\n") { "${it.start.toString(16)} ${it.end.toString(16)}" })
+            val command = buildCommand(
+                context,
+                listOf(
+                    "activity", pid.toString(), regionsFile.absolutePath, samples.toString(), intervalMs.toString(),
+                    outFile.absolutePath, budgetMb.toString(), cancelFile.absolutePath
+                )
+            )
+            val process = ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
+            val lastLine = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+            val watchdog = Thread {
+                try {
+                    while (process.isAlive) {
+                        Thread.sleep(1000)
+                        if (System.currentTimeMillis() - lastLine.get() > ACTIVITY_STALL_MS) { process.destroyForcibly(); break }
+                    }
+                } catch (_: InterruptedException) {}
+            }.apply { isDaemon = true; start() }
+
+            var cancelled = false
+            var error: String? = null
+            var done = false
+            try {
+                process.inputStream.bufferedReader().use { r ->
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        lastLine.set(System.currentTimeMillis())
+                        when {
+                            line.startsWith("P ") -> {
+                                val parts = line.split(" ")
+                                onProgress(parts.getOrNull(1)?.toIntOrNull() ?: 0, parts.getOrNull(2)?.toIntOrNull() ?: samples)
+                                if (!cancelled && isCancelled()) { cancelled = true; cancelFile.writeText("x") }
+                            }
+                            line == "DONE" -> done = true
+                            line == "CANCELLED" -> cancelled = true
+                            line.startsWith("ERR") -> error = line
+                        }
+                    }
+                }
+            } finally {
+                watchdog.interrupt()
+                if (process.isAlive) process.destroyForcibly()
+            }
+            if (cancelled) return ActivityScanOutcome(emptyList(), true)
+            if (error != null) throw IllegalStateException(error)
+            if (!done || !outFile.isFile) throw IllegalStateException("the scan helper stopped before finishing (it may have been killed)")
+
+            DataInputStream(BufferedInputStream(FileInputStream(outFile), 256 * 1024)).use { input ->
+                val head = ByteArray(8)
+                input.readFully(head)
+                val hb = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+                hb.position(4)
+                val n = hb.int
+                val results = ArrayList<ActivityRegionResult>(n)
+                val rec = ByteArray(28)
+                for (i in 0 until n) {
+                    input.readFully(rec)
+                    val rb = ByteBuffer.wrap(rec).order(ByteOrder.LITTLE_ENDIAN)
+                    rb.position(16)
+                    val gran = rb.int
+                    val nGran = rb.int
+                    val status = rb.int
+                    val region = regions.getOrNull(i) ?: continue
+                    val counts = if (status == 0) ByteArray(nGran).also { input.readFully(it) } else null
+                    results += ActivityRegionResult(region, gran, counts)
+                }
+                return ActivityScanOutcome(results, false)
+            }
+        } finally {
+            regionsFile.delete(); outFile.delete(); cancelFile.delete()
+        }
+    }
+
+    private const val ACTIVITY_STALL_MS = 120_000L
 }

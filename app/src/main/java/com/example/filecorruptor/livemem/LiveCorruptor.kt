@@ -60,6 +60,69 @@ object LiveCorruptor {
     private val reportedCrashes = HashMap<Int, Pair<Long, CrashReport>>()
     private const val REPORT_REUSE_MS = 20_000L
 
+    /** The slice of a region one tick works on. */
+    private class Window(val offset: Long, val length: Int)
+
+    /** Next window start per target, so successive ticks sweep the whole region. */
+    private val cursors = HashMap<String, Long>()
+
+    private fun paramLong(engine: EngineDefinition, values: Map<String, ParamValue>, arg: String): Long {
+        for (op in engine.operations) {
+            val id = op.params[arg] ?: continue
+            val v = values[id]?.asLong() ?: continue
+            return v
+        }
+        return -1L
+    }
+
+    /**
+     * Big regions are never loaded whole: a tick reads, corrupts and patches one window of at most
+     * [MemoryGovernor.windowBytes]. If the engine has a range (rangeStart/rangeEnd) the windows stay
+     * inside it; otherwise successive ticks sweep through the region.
+     */
+    private fun pickWindow(ctx: Context, process: LiveProcess, region: MemoryRegion, engine: EngineDefinition, values: Map<String, ParamValue>): Window {
+        val size = region.size
+        val wBytes = MemoryGovernor.windowBytes(ctx)
+        if (size <= wBytes) return Window(0, size.toInt())
+
+        val rs = paramLong(engine, values, "rangeStart")
+        val re = paramLong(engine, values, "rangeEnd")
+        val spanStart = if (rs >= 0) rs.coerceAtMost(size) else 0L
+        val spanEnd = if (re >= 0) re.coerceIn(spanStart, size) else size
+        if (spanEnd <= spanStart) return Window(0, minOf(size, wBytes).toInt())
+
+        val base = spanStart and 4095L.inv()
+        val total = spanEnd - base
+        if (total <= wBytes) return Window(base, total.toInt())
+
+        val key = "${process.pid}|${region.start}"
+        val cur = synchronized(cursors) { cursors[key] ?: 0L }
+        val rel = if (cur >= total) 0L else cur
+        val len = minOf(wBytes, total - rel)
+        synchronized(cursors) { cursors[key] = rel + len }
+        return Window(base + rel, len.toInt())
+    }
+
+    /** Re-expresses the engine's range/header parameters relative to the window instead of the region. */
+    private fun windowValues(engine: EngineDefinition, values: Map<String, ParamValue>, w: Window): Map<String, ParamValue> {
+        val out = HashMap(values)
+        for (op in engine.operations) {
+            op.params["rangeStart"]?.let { id ->
+                val v = values[id]?.asLong() ?: -1L
+                if (v >= 0) out[id] = ParamValue.of((v - w.offset).coerceIn(0L, w.length.toLong()).toString())
+            }
+            op.params["rangeEnd"]?.let { id ->
+                val v = values[id]?.asLong() ?: -1L
+                if (v >= 0) out[id] = ParamValue.of((v - w.offset).coerceIn(0L, w.length.toLong()).toString())
+            }
+            if (w.offset > 0L) { // a header / skipped prefix only exists at the start of the region
+                op.params["headerSize"]?.let { out[it] = ParamValue.of("0") }
+                op.params["skipBytes"]?.let { out[it] = ParamValue.of("0") }
+            }
+        }
+        return out
+    }
+
     private fun mapIndexFor(context: Context, pid: Int): AntiCrash.MapIndex? {
         val now = System.currentTimeMillis()
         synchronized(mapCache) {
@@ -101,7 +164,9 @@ object LiveCorruptor {
             throw IllegalStateException("region 0x${region.start.toString(16)} of ${process.name} is not writable")
         }
 
-        val (original, readError) = RootMemoryHelper.readMemoryResult(ctx, process.pid, region.start, region.size.toInt())
+        val win = pickWindow(ctx, process, region, engine, values)
+        val winStart = region.start + win.offset
+        val (original, readError) = RootMemoryHelper.readMemoryResult(ctx, process.pid, winStart, win.length)
         if (original == null) {
             if (regionIsGone(ctx, process.pid, region, readError)) {
                 throw RegionGoneException(
@@ -112,7 +177,7 @@ object LiveCorruptor {
             throw explainFailure(ctx, process, "could not read region", readError)
         }
 
-        val run = CorruptionEngineExecutor.runWithSeed(original, engine, values, protectKnownHeaders = false)
+        val run = CorruptionEngineExecutor.runWithSeed(original, engine, windowValues(engine, values, win), protectKnownHeaders = false)
         val corrupted = run.bytes // runWithSeed works on a copy; `original` is still pristine
 
         var shielded = 0
@@ -121,13 +186,16 @@ object LiveCorruptor {
         if (cfg.enabled) {
             // 1. Allocator headers first: the only thing that ever actually crashed the target in the logs.
             if (cfg.heapGuard) {
-                headers = ScudoGuard.shield(original, corrupted, ScudoGuard.kindOf(region.path))
+                headers = ScudoGuard.shield(original, corrupted, ScudoGuard.kindOf(region.path), win.offset)
             }
             if (cfg.pointerShield) {
-                mapIndexFor(ctx, process.pid)?.let { shielded = AntiCrash.shieldPointers(original, corrupted, it) }
+                mapIndexFor(ctx, process.pid)?.let {
+                    shielded = AntiCrash.shieldPointers(original, corrupted, it) +
+                        AntiCrash.shieldNullSlots(original, corrupted, it)
+                }
             }
             if (cfg.quarantine && AntiCrash.isLearnable(region)) {
-                quarantinedBytes = AntiCrash.applyQuarantine(AntiCrash.targetKey(process.name, region), original, corrupted)
+                quarantinedBytes = AntiCrash.applyQuarantine(AntiCrash.targetKey(process.name, region), original, corrupted, win.offset)
             }
         }
 
@@ -139,7 +207,7 @@ object LiveCorruptor {
                 return Outcome(run.seedUsed, 0, 0, shielded, quarantinedBytes, headers, 0)
             }
             if (AntiCrash.isLearnable(region)) {
-                AntiCrash.recordCycle(AntiCrash.targetKey(process.name, region), patches)
+                AntiCrash.recordCycle(AntiCrash.targetKey(process.name, region), patches, win.offset)
             }
 
             var applied = patches.size
@@ -147,10 +215,10 @@ object LiveCorruptor {
             val writtenBytes = patches.sumOf { it.bytes.size } // bytes in the patch set; stale ones may be skipped
             if (cfg.verifyBeforeWrite) {
                 val res = RootMemoryHelper.patchMemoryChecked(
-                    ctx, process.pid, region.start, region.end,
+                    ctx, process.pid, winStart, winStart + win.length,
                     patches.map {
                         CheckedPatch(
-                            region.start + it.offset,
+                            winStart + it.offset,
                             original.copyOfRange(it.offset, it.offset + it.bytes.size),
                             it.bytes
                         )
@@ -164,8 +232,8 @@ object LiveCorruptor {
                 }
             } else {
                 val err = RootMemoryHelper.patchMemory(
-                    ctx, process.pid, region.start, region.end,
-                    patches.map { MemoryPatch(region.start + it.offset, it.bytes) }
+                    ctx, process.pid, winStart, winStart + win.length,
+                    patches.map { MemoryPatch(winStart + it.offset, it.bytes) }
                 )
                 if (err != null) throw explainFailure(ctx, process, "write failed", err)
             }
@@ -180,10 +248,10 @@ object LiveCorruptor {
         }
 
         // Anti-crash off (or minimal patches off): the original whole-region write-back.
-        if (!RootMemoryHelper.writeMemory(ctx, process.pid, region.start, corrupted)) {
+        if (!RootMemoryHelper.writeMemory(ctx, process.pid, winStart, corrupted)) {
             throw explainFailure(ctx, process, "write failed", null)
         }
-        RtcLog.d(TAG, "$where seed=${run.seedUsed}: wrote whole region (${corrupted.size} bytes)")
+        RtcLog.d(TAG, "$where seed=${run.seedUsed}: wrote window 0x${win.offset.toString(16)}+${corrupted.size} (${corrupted.size} bytes)")
         return Outcome(run.seedUsed, 1, corrupted.size, shielded, quarantinedBytes, headers, 0)
     }
 

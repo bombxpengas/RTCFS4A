@@ -87,14 +87,17 @@ object ScudoGuard {
      * prefix) that [corrupted] changed, judged from the untouched [original].
      * Returns the number of protected units (a header word, or the prefix bytes).
      */
-    fun shield(original: ByteArray, corrupted: ByteArray, kind: Kind): Int {
+    fun shield(original: ByteArray, corrupted: ByteArray, kind: Kind, regionOffset: Long = 0L): Int {
         if (kind == Kind.NONE) return 0
         val n = minOf(original.size, corrupted.size)
         var protectedUnits = 0
         var start = 0
 
-        if (kind == Kind.SECONDARY) {
-            val prefix = minOf(n, SECONDARY_PREFIX)
+        // [regionOffset] = where this buffer begins inside the region (live corruption works on windows).
+        // Windows start on 4 KiB boundaries, so 16-byte header alignment is preserved.
+        val prefixLeft = SECONDARY_PREFIX - regionOffset
+        if (kind == Kind.SECONDARY && prefixLeft > 0) {
+            val prefix = minOf(n.toLong(), prefixLeft).toInt()
             for (i in 0 until prefix) {
                 if (corrupted[i] != original[i]) {
                     corrupted[i] = original[i]

@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.filecorruptor.log.CrashReporter
 import com.example.filecorruptor.log.RtcLog
+import com.example.filecorruptor.livemem.MemoryGovernor
 import com.example.filecorruptor.safety.AntiCrash
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -35,6 +36,8 @@ fun LogsScreen() {
 
     val config by AntiCrash.config.collectAsState()
     val stats by AntiCrash.stats.collectAsState()
+    val windowMb by MemoryGovernor.windowMb.collectAsState()
+    LaunchedEffect(Unit) { MemoryGovernor.init(context) }
     val entries by RtcLog.entries.collectAsState()
 
     var minLevel by remember { mutableStateOf(RtcLog.Level.INFO) }
@@ -187,6 +190,31 @@ fun LogsScreen() {
                         enabled = quarantined > 0
                     ) { Text("Clear") }
                 }
+            }
+        }
+
+        // ---------------- Memory ----------------
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+                Text(
+                    "Big regions are never loaded whole. Live corrupting works on one window of the region per tick " +
+                        "(sweeping through it, or staying inside your range), and activity scans run in the native helper " +
+                        "with a fixed memory budget at a lower priority. A smaller window = lighter on the phone and " +
+                        "other apps; a bigger one = more of a large region corrupted per tick. It also shrinks by itself " +
+                        "when Android is low on memory.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                val choices = MemoryGovernor.WINDOW_CHOICES_MB
+                val index = choices.indexOf(windowMb).coerceAtLeast(0)
+                Text("Live RAM window: $windowMb MB per tick", style = MaterialTheme.typography.bodyMedium)
+                Slider(
+                    value = index.toFloat(),
+                    onValueChange = { MemoryGovernor.setWindowMb(context, choices[it.toInt().coerceIn(0, choices.lastIndex)]) },
+                    valueRange = 0f..choices.lastIndex.toFloat(),
+                    steps = choices.size - 2
+                )
             }
         }
 

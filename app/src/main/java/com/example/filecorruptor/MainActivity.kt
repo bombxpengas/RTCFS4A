@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
         // anti-crash settings, so everything after this point is on record.
         RtcLog.init(applicationContext)
         AntiCrash.init(applicationContext)
+        com.example.filecorruptor.livemem.MemoryGovernor.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             FileCorruptorTheme {

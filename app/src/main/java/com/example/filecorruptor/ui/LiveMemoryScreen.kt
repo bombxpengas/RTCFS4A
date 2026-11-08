@@ -45,6 +45,7 @@ import com.example.filecorruptor.engine.isVisible
 import com.example.filecorruptor.livemem.LiveSession
 import com.example.filecorruptor.livemem.LiveTarget
 import com.example.filecorruptor.livemem.LiveProcess
+import com.example.filecorruptor.livemem.MemoryGovernor
 import com.example.filecorruptor.livemem.MemoryRegion
 import com.example.filecorruptor.log.RtcLog
 import com.example.filecorruptor.overlay.OverlayService
@@ -133,41 +134,82 @@ private data class HotWindow(val offsetStart: Int, val offsetEnd: Int, val chang
 
 /** Result of analyzing one region: its hot windows (ranked), the total
  *  activity score across the whole region (for ranking regions against
- *  each other), and the raw per-byte change counts — kept around so a
- *  fixed-size search can be re-run instantly against already-collected
- *  data instead of needing a fresh (expensive) scan every time you tweak
- *  the target size. */
-private data class RegionActivity(val windows: List<HotWindow>, val totalScore: Int, val changeCounts: IntArray)
+ *  each other), and the raw change counters — kept so a fixed-size search can
+ *  be re-run instantly against already-collected data. The counters are one
+ *  unsigned byte per [granule] bytes of the region (granule 1 = byte-exact;
+ *  big regions use coarser granules so a scan always fits its memory budget
+ *  instead of needing 4+ bytes of counter per byte scanned). */
+private data class RegionActivity(
+    val windows: List<HotWindow>,
+    val totalScore: Int,
+    val counts: ByteArray,
+    val granule: Int
+)
 
-/** Clusters a finished per-byte change-count array into a short, rankable
- *  list of windows (small gaps between changed bytes tolerated) instead of
- *  a raw per-byte dump. Shared by both the single-region and batch paths. */
-private fun windowsFromChangeCounts(changeCounts: IntArray): RegionActivity {
-    val size = changeCounts.size
-    val maxGapBytes = 16
+/** Clusters a finished change-counter array into a short, rankable list of
+ *  windows (small gaps between changed granules tolerated) instead of a raw
+ *  dump. Offsets are reported in bytes of the region. */
+private fun windowsFromCounts(counts: ByteArray, granule: Int): RegionActivity {
+    val size = counts.size
+    val maxGap = maxOf(1, 16 / granule)
     val windows = mutableListOf<HotWindow>()
+    var total = 0L
     var i = 0
     while (i < size) {
-        if (changeCounts[i] > 0) {
+        val c = counts[i].toInt() and 0xFF
+        if (c > 0) {
             val windowStart = i
             var lastActive = i
-            var score = changeCounts[i]
+            var score = c.toLong()
             var j = i + 1
-            while (j < size && (j - lastActive) <= maxGapBytes) {
-                if (changeCounts[j] > 0) {
-                    score += changeCounts[j]
+            while (j < size && (j - lastActive) <= maxGap) {
+                val cj = counts[j].toInt() and 0xFF
+                if (cj > 0) {
+                    score += cj
                     lastActive = j
                 }
                 j++
             }
-            windows.add(HotWindow(windowStart, lastActive + 1, score))
+            total += score
+            windows.add(
+                HotWindow(
+                    (windowStart.toLong() * granule).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    ((lastActive + 1).toLong() * granule).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    score.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                )
+            )
             i = lastActive + 1
         } else {
             i++
         }
     }
-    val totalScore = changeCounts.sum()
-    return RegionActivity(windows.sortedByDescending { it.changeScore }.take(25), totalScore, changeCounts)
+    return RegionActivity(
+        windows.sortedByDescending { it.changeScore }.take(25),
+        total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+        counts,
+        granule
+    )
+}
+
+/** Keeps the cached scan results from growing without bound: past the cap, the oldest unrelated
+ *  entries are dropped (their lists simply show as "not analyzed" again). */
+private const val ACTIVITY_CACHE_MAX_BYTES = 64L * 1024 * 1024
+
+private fun trimActivity(
+    map: Map<MemoryRegion, RegionActivity>,
+    keep: Collection<MemoryRegion>
+): Map<MemoryRegion, RegionActivity> {
+    var total = map.values.sumOf { it.counts.size.toLong() }
+    if (total <= ACTIVITY_CACHE_MAX_BYTES) return map
+    val out = LinkedHashMap(map)
+    val it = out.entries.iterator()
+    while (total > ACTIVITY_CACHE_MAX_BYTES && it.hasNext()) {
+        val e = it.next()
+        if (e.key in keep) continue
+        total -= e.value.counts.size
+        it.remove()
+    }
+    return out
 }
 
 /**
@@ -183,60 +225,92 @@ private fun windowsFromChangeCounts(changeCounts: IntArray): RegionActivity {
  * Non-max suppression avoids returning a dozen near-identical windows
  * that are really just the same hot spot shifted by a few bytes.
  */
-private fun findBestFixedSizeWindows(changeCounts: IntArray, targetSize: Int, topN: Int = 10): List<HotWindow> {
-    val size = changeCounts.size
-    if (targetSize <= 0 || targetSize > size) return emptyList()
+private fun findBestFixedSizeWindows(counts: ByteArray, granule: Int, targetBytes: Int, topN: Int = 10): List<HotWindow> {
+    val size = counts.size
+    // Work in counter units; the reported span keeps the exact byte size that was asked for.
+    val targetSize = ((targetBytes.toLong() + granule - 1) / granule).toInt().coerceAtLeast(1)
+    if (targetBytes <= 0 || targetSize > size) return emptyList()
 
-    val prefix = LongArray(size + 1)
-    for (i in 0 until size) prefix[i + 1] = prefix[i] + changeCounts[i]
+    // Memory-safe version. The old one built a boxed Pair<Int, Long> for EVERY offset of the region
+    // (tens of bytes each) plus an 8-byte prefix sum per byte, and ran on every recomposition —
+    // on a big scudo region that is what threw OutOfMemoryError (log: "Integer.valueOf ... giving
+    // up on allocation because <1% of heap free"). Now: one sliding-window pass with primitives,
+    // keeping only the best window start per block of candidates.
+    val blockLen = maxOf(targetSize, size / 100_000 + 1)
+    val nBlocks = (size - targetSize) / blockLen + 1
+    val bestStart = IntArray(nBlocks)
+    val bestScore = LongArray(nBlocks) { -1L }
 
-    val candidates = ArrayList<Pair<Int, Long>>(size - targetSize + 1)
-    for (start in 0..(size - targetSize)) {
-        val score = prefix[start + targetSize] - prefix[start]
-        if (score > 0) candidates.add(start to score)
+    var sum = 0L
+    for (i in 0 until targetSize) sum += counts[i].toInt() and 0xFF
+    var start = 0
+    var totalScore = 0L
+    var positives = 0L
+    while (true) {
+        val b = start / blockLen
+        if (sum > bestScore[b]) { bestScore[b] = sum; bestStart[b] = start }
+        if (sum > 0) { totalScore += sum; positives++ }
+        if (start + targetSize >= size) break
+        sum += (counts[start + targetSize].toInt() and 0xFF) - (counts[start].toInt() and 0xFF)
+        start++
     }
+    if (positives == 0L) return emptyList()
 
-    // In a region that's genuinely busy almost everywhere (a shared Scudo
-    // primary arena serving many small/medium allocations at once is the
-    // textbook case), a plain top-N will surface a pile of merely-average
-    // spans rather than anything that actually stands out — there isn't a
-    // bug to fix there, that's an accurate reflection of the region really
-    // being active in many unrelated places simultaneously. What this can
-    // do is filter down to spans that are meaningfully above the region's
-    // own average, so what's left is closer to "the standout spots" than
-    // "everywhere with any activity at all". If a region has no standout
-    // spots because it's uniformly busy, fewer (or zero) results below is
-    // itself informative — it suggests this isn't a single isolated buffer.
-    if (candidates.isEmpty()) return emptyList()
-    val meanScore = candidates.sumOf { it.second }.toDouble() / candidates.size
-    val threshold = meanScore * 1.5
-    val aboveAverage = candidates.filter { it.second >= threshold }
-    val pool = aboveAverage.ifEmpty { candidates } // fall back to unfiltered rather than showing nothing
-    val sortedCandidates = pool.sortedByDescending { it.second }
+    // In a region that's busy almost everywhere (a shared Scudo primary arena), keep only spans
+    // meaningfully above the region's own average; fall back to everything rather than nothing.
+    val threshold = (totalScore.toDouble() / positives) * 1.5
+    var pool = (0 until nBlocks).filter { bestScore[it] > 0 && bestScore[it] >= threshold }
+    if (pool.isEmpty()) pool = (0 until nBlocks).filter { bestScore[it] > 0 }
+    val ordered = pool.sortedByDescending { bestScore[it] }
 
     val picked = mutableListOf<HotWindow>()
-    for ((start, score) in sortedCandidates) {
+    for (blk in ordered) {
         if (picked.size >= topN) break
-        val end = start + targetSize
-        val overlapsExisting = picked.any { w -> start < w.offsetEnd && end > w.offsetStart }
-        if (!overlapsExisting) {
-            picked.add(HotWindow(start, end, score.toInt()))
-        }
+        val st = (bestStart[blk].toLong() * granule).coerceAtMost(Int.MAX_VALUE.toLong() - targetBytes).toInt()
+        val end = st + targetBytes
+        val overlapsExisting = picked.any { w -> st < w.offsetEnd && end > w.offsetStart }
+        if (!overlapsExisting) picked.add(HotWindow(st, end, bestScore[blk].coerceAtMost(Int.MAX_VALUE.toLong()).toInt()))
     }
     return picked
 }
 
 /**
- * Reads [region] repeatedly (with a short delay between reads, so real
- * gameplay has a chance to actually change something), diffing each new
- * read against only the *previous* one and then discarding it — this is
- * the fix for a real crash: the first version kept every sample's full
- * byte array in memory until the very end, so memory scaled with
- * samples × region size. With the sample cap raised to 300, that could
- * mean holding hundreds of copies of a multi-MB region at once — an easy
- * OutOfMemoryError. A running per-byte change-count array is all that's
- * actually needed, so memory here no longer depends on sample count at all.
+ * Activity scan, done natively (see `activity` in rtmem_helper.c): the helper samples the regions
+ * itself and keeps only a hash + counter per *granule*, sized so the whole scan fits a fixed memory
+ * budget. That replaced a Java version that held two full copies of the region per sample plus a
+ * 4-byte counter per byte (an 80 MB region needed ~500 MB — more than the app's heap) and wrote the
+ * region to storage on every sample. It also no longer stops the target while reading, runs at
+ * background priority and pauses between chunks, so other apps keep running smoothly.
  */
+private suspend fun runActivityScan(
+    context: android.content.Context,
+    pid: Int,
+    regions: List<MemoryRegion>,
+    samples: Int,
+    intervalMs: Long,
+    onProgress: (done: Int, total: Int) -> Unit
+): Map<MemoryRegion, RegionActivity> {
+    val job = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+    val eligible = regions.filter { it.size in 1..Int.MAX_VALUE.toLong() }
+    if (eligible.isEmpty()) return emptyMap()
+    val outcome = RootMemoryHelper.activityScan(
+        context, pid, eligible, samples, intervalMs,
+        MemoryGovernor.analysisBudgetMb(context), onProgress
+    ) { job?.isActive == false }
+    if (outcome.cancelled) return emptyMap()
+    val out = HashMap<MemoryRegion, RegionActivity>()
+    var skipped = 0
+    for (r in outcome.results) {
+        val c = r.counts
+        if (c == null) { skipped++; continue }
+        out[r.region] = windowsFromCounts(c, r.granule)
+    }
+    if (skipped > 0) {
+        RtcLog.w("Analyze", "$skipped region(s) skipped: too big for the scan's memory budget even at the coarsest resolution — analyze them on their own")
+    }
+    return out
+}
+
 private suspend fun analyzeRegionActivity(
     context: android.content.Context,
     pid: Int,
@@ -245,48 +319,14 @@ private suspend fun analyzeRegionActivity(
     intervalMs: Long,
     onProgress: (done: Int, total: Int) -> Unit
 ): RegionActivity {
-    val size = region.size.toInt()
-    if (size <= 0) return RegionActivity(emptyList(), 0, IntArray(0))
-
-    val changeCounts = IntArray(size)
-    var previous: ByteArray? = null
-    repeat(samples) { i ->
-        val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size)
-        if (bytes != null) {
-            val prev = previous
-            if (prev != null && prev.size == size && bytes.size == size) {
-                for (j in 0 until size) {
-                    if (prev[j] != bytes[j]) changeCounts[j]++
-                }
-            }
-            previous = bytes // replaces the old array, which is now free to be collected
-        }
-        onProgress(i + 1, samples)
-        if (i < samples - 1) delay(intervalMs)
-    }
-    return windowsFromChangeCounts(changeCounts)
+    if (region.size <= 0) return RegionActivity(emptyList(), 0, ByteArray(0), 1)
+    return runActivityScan(context, pid, listOf(region), samples, intervalMs, onProgress)[region]
+        ?: throw IllegalStateException(
+            "${formatSize(region.size)} is too big to analyze within the memory budget, even at the coarsest resolution " +
+                "(or the scan was cancelled)"
+        )
 }
 
-/**
- * Same idea as [analyzeRegionActivity], but across every region at once —
- * and, crucially, *interleaved*: each round reads every region once before
- * moving to the next round, rather than fully sampling region A and then
- * fully sampling region B. That means every region gets compared at the
- * same moments in time (fairer — a burst of activity between two rounds
- * shows up for all of them at once), and the whole scan still only takes
- * samples × interval, not that multiplied by the number of regions.
- *
- * Each region's *previous* sample lives in its own small temp file rather
- * than an in-memory map — read the old one, compare, overwrite it with the
- * new one, move on. That keeps only one region's snapshot in RAM at a time
- * no matter how many regions are being batch-analyzed, instead of holding
- * every region's previous snapshot simultaneously (which is what could
- * still add up with "Analyze All" across many/large regions even after the
- * streaming fix above). The running per-byte change-count arrays still
- * live in memory for the whole scan — an unavoidable minimum, since a
- * cumulative count has to accumulate somewhere — but that's the much
- * smaller of the two costs.
- */
 private suspend fun analyzeAllRegionsActivity(
     context: android.content.Context,
     pid: Int,
@@ -296,35 +336,45 @@ private suspend fun analyzeAllRegionsActivity(
     onProgress: (done: Int, total: Int) -> Unit
 ): Map<MemoryRegion, RegionActivity> {
     if (regions.isEmpty()) return emptyMap()
-    val changeCountsByRegion = regions.associateWith { IntArray(it.size.toInt()) }
-    val tempFiles = regions.associateWith { region ->
-        File(context.cacheDir, "rtmem_activity_${region.start.toString(16)}_${System.nanoTime()}.tmp")
-    }
+    return runActivityScan(context, pid, regions, samples, intervalMs, onProgress)
+}
 
-    try {
-        repeat(samples) { i ->
-            for (region in regions) {
-                val size = region.size.toInt()
-                if (size <= 0) continue
-                val bytes = RootMemoryHelper.readMemory(context, pid, region.start, size) ?: continue
-                val tempFile = tempFiles.getValue(region)
-                if (tempFile.exists() && tempFile.length() == size.toLong()) {
-                    val prev = tempFile.readBytes()
-                    val counts = changeCountsByRegion.getValue(region)
-                    for (j in 0 until size) {
-                        if (prev[j] != bytes[j]) counts[j]++
-                    }
-                }
-                tempFile.writeBytes(bytes) // overwrites for the next round's comparison
+private const val NES_SCAN_CHUNK = 2 * 1024 * 1024
+private const val NES_SCAN_OVERLAP = 512
+private const val NES_SCAN_MAX_PER_REGION = 256L * 1024 * 1024
+
+/**
+ * Looks for NES palette/OAM-shaped bytes in [region] a chunk at a time (with an overlap so a pattern
+ * straddling a boundary is still seen once), instead of reading up to 16 MB in one go and silently
+ * ignoring the rest of a bigger region. Memory use is one chunk, whatever the region size.
+ */
+private fun scanRegionForNesAnchors(
+    context: android.content.Context,
+    pid: Int,
+    region: MemoryRegion
+): List<NesAnchorHit> {
+    val total = minOf(region.size, NES_SCAN_MAX_PER_REGION)
+    val out = ArrayList<NesAnchorHit>()
+    val lastEnd = HashMap<String, Long>()
+    var off = 0L
+    while (off < total) {
+        val len = minOf(NES_SCAN_CHUNK.toLong() + NES_SCAN_OVERLAP, region.size - off).toInt()
+        val bytes = RootMemoryHelper.readMemory(context, pid, region.start + off, len)
+        if (bytes != null) {
+            val lastChunk = off + NES_SCAN_CHUNK >= total
+            val hits = (findPaletteRamAnchors(bytes) + findOamAnchors(bytes)).sortedBy { it.offset }
+            for (h in hits) {
+                if (!lastChunk && h.offset >= NES_SCAN_CHUNK) continue // belongs to the next chunk
+                val abs = off + h.offset
+                if (abs < (lastEnd[h.kind.name] ?: -1L)) continue // already reported by the previous chunk
+                lastEnd[h.kind.name] = abs + h.size
+                out += h.copy(offset = abs.toInt())
             }
-            onProgress(i + 1, samples)
-            if (i < samples - 1) delay(intervalMs)
         }
-    } finally {
-        tempFiles.values.forEach { it.delete() } // always clean up, even on failure/cancellation
+        off += NES_SCAN_CHUNK
+        try { Thread.sleep(2) } catch (_: InterruptedException) { break } // breathing room for other apps
     }
-
-    return regions.associateWith { region -> windowsFromChangeCounts(changeCountsByRegion.getValue(region)) }
+    return out
 }
 
 // Shared with the floating overlay (see LiveSession): the targets live in the session, not in this screen.
@@ -799,7 +849,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                 analysisRunning = false
                                 LiveSession.clearProgress()
                                 outcome.onSuccess { result ->
-                                    regionActivity = regionActivity + result
+                                    regionActivity = trimActivity(regionActivity + result, result.keys)
                                     expandedActivityRegion = result.maxByOrNull { it.value.totalScore }?.key
                                 }.onFailure { e ->
                                     isErrorStatus = true
@@ -836,16 +886,8 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             scope.launch {
                                 val results = withContext(Dispatchers.IO) {
                                     val out = mutableMapOf<MemoryRegion, List<NesAnchorHit>>()
-                                    // Anchors are small (32/256 bytes), but scanning still means
-                                    // reading the whole region — cap it so one huge mapping can't
-                                    // stall the scan or blow up memory the way "Analyze All" guards
-                                    // against for the same reason.
-                                    val readCap = 16 * 1024 * 1024
                                     for (region in toScan) {
-                                        val readSize = minOf(region.size, readCap.toLong()).toInt()
-                                        val bytes = RootMemoryHelper.readMemory(context, proc.pid, region.start, readSize)
-                                            ?: continue
-                                        val hits = findPaletteRamAnchors(bytes) + findOamAnchors(bytes)
+                                        val hits = scanRegionForNesAnchors(context, proc.pid, region)
                                         if (hits.isNotEmpty()) out[region] = hits
                                     }
                                     out
@@ -1023,7 +1065,7 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                                         analysisRunning = false
                                                         LiveSession.clearProgress()
                                                         outcome.onSuccess { result ->
-                                                            regionActivity = regionActivity + (region to result)
+                                                            regionActivity = trimActivity(regionActivity + (region to result), listOf(region))
                                                         }.onFailure { e ->
                                                             isErrorStatus = true
                                                             statusMessage = if (e is OutOfMemoryError) {
@@ -1245,9 +1287,15 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 if (!analysisRunning && expandedRegion != null) {
                     val activity = regionActivity[expandedRegion]
                     val targetSize = targetSizeText.toIntOrNull()?.takeIf { it > 0 }
+                    // Computed off the main thread and only when the inputs change (it used to run on every recomposition).
+                    val fixedWindows by produceState<List<HotWindow>?>(null, activity, targetSize) {
+                        value = if (activity != null && targetSize != null) {
+                            withContext(Dispatchers.Default) { findBestFixedSizeWindows(activity.counts, activity.granule, targetSize) }
+                        } else null
+                    }
                     val displayWindows = when {
                         activity == null -> emptyList()
-                        targetSize != null -> findBestFixedSizeWindows(activity.changeCounts, targetSize)
+                        targetSize != null -> fixedWindows ?: emptyList()
                         else -> activity.windows
                     }
                     Text(

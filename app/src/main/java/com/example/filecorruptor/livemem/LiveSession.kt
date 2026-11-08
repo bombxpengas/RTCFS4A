@@ -269,7 +269,7 @@ object LiveSession {
                 if (e is LiveCorruptor.TargetDiedException) dead += t.process.pid
                 lastError = when (e) {
                     is OutOfMemoryError ->
-                        "out of memory on ${t.process.name} (${t.region.size / 1_048_576} MB) — too large to hold twice at once"
+                        "out of memory on ${t.process.name} — lower the \"Live RAM window\" in Logs → Memory (region is ${t.region.size / 1_048_576} MB)"
                     else -> e.message ?: e.toString()
                 }
                 RtcLog.w(TAG, "${t.process.name}: $lastError")

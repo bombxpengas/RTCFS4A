@@ -56,6 +56,29 @@
  *          bytes, <length> new bytes.
  *          Prints: OK applied=N skipped=N unmapped=N failed=N frozen=N
  *
+ *   rtmem_helper readbin <pid> <hex_address> <length>
+ *       -> prints "DATA <length>\n" followed by exactly <length> raw bytes on
+ *          stdout (or "ERR <msg>\n"). Same as `read` but no temp file: a big
+ *          region used to be written to flash on every tick just to be read
+ *          back. Does NOT stop the target (a snapshot may be a little torn;
+ *          `cpatch` re-checks every byte it writes, so that is harmless).
+ *
+ *   rtmem_helper activity <pid> <regions_file> <samples> <interval_ms> <out_file> <budget_mb> <cancel_file>
+ *       -> bounded-memory "what changes while the app runs" scan, done natively.
+ *          regions_file: one "<hex_start> <hex_end>" per line. Every region is
+ *          sampled <samples> times (interleaved, so all see the same moments)
+ *          in 256 KB chunks; per region it keeps only a 1-byte hash and a
+ *          1-byte saturating change counter per *granule* (1..64 bytes),
+ *          chosen so ALL regions together fit in <budget_mb>. A 1-byte
+ *          granule is exact; larger ones trade resolution for memory, so an
+ *          80 MB region costs ~20 MB instead of ~500 MB. Runs niced and
+ *          pauses between chunks so other apps don't stutter, and never
+ *          stops the target. Prints "P <done> <total>" after each sample and
+ *          "DONE" at the end; stops early if <cancel_file> appears.
+ *          out_file: "RTA1", u32 nRegions, then per region u64 start,
+ *          u64 size, u32 granule, u32 nGranules, u32 status (0 ok,
+ *          1 skipped: over budget), then nGranules counter bytes if ok.
+ *
  *   rtmem_helper alive <pid> <name>
  *       -> ALIVE | STOPPED | DEAD [reason]. <name> must match the pid's
  *          argv[0], so a recycled pid is reported as DEAD, not ALIVE.
@@ -87,6 +110,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 
 #ifndef __WALL
@@ -657,6 +681,185 @@ static void cmd_cpatch(pid_t pid, uint64_t regionStart, uint64_t regionEnd, cons
     printf("OK applied=%d skipped=%d unmapped=%d failed=%d frozen=%d\n", applied, skipped, unmapped, failed, frozen);
 }
 
+/* ------------------------------------------------------------------ */
+/* readbin + activity: bounded-memory, no temp files, no target stop    */
+/* ------------------------------------------------------------------ */
+
+#include <sched.h>
+#include <time.h>
+
+static int write_all(int fd, const unsigned char *p, size_t n) {
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        p += w; n -= (size_t) w;
+    }
+    return 0;
+}
+
+static void cmd_readbin(pid_t pid, uint64_t address, size_t length) {
+    if (length == 0 || length > ((size_t) 1 << 30)) { printf("ERR bad length\n"); return; }
+    char memPath[64];
+    snprintf(memPath, sizeof(memPath), "/proc/%d/mem", pid);
+    int fd = open(memPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { printf("ERR open mem failed: %s\n", strerror(errno)); return; }
+    unsigned char *buf = malloc(length);
+    if (!buf) { close(fd); printf("ERR out of memory\n"); return; }
+    int rc = pread_full(fd, buf, length, address);
+    int e = errno;
+    close(fd);
+    if (rc != 0) { free(buf); printf("ERR read failed at 0x%" PRIx64 ": %s\n", address, strerror(e)); return; }
+    char head[48];
+    int hn = snprintf(head, sizeof(head), "DATA %zu\n", length);
+    fflush(stdout);
+    if (write_all(1, (const unsigned char *) head, (size_t) hn) != 0 || write_all(1, buf, length) != 0) {
+        free(buf);
+        return;
+    }
+    free(buf);
+}
+
+#define ACT_CHUNK (256 * 1024)
+#define ACT_MAX_REGIONS 8192
+
+typedef struct {
+    uint64_t start, size;
+    uint32_t gran, nGran, status;
+    unsigned char *hash;   /* previous-sample hash per granule */
+    unsigned char *cnt;    /* saturating change counter per granule */
+    unsigned char *valid;  /* per chunk: has a comparable previous sample */
+} ActRegion;
+
+static unsigned char gran_hash(const unsigned char *p, uint32_t g) {
+    if (g == 1) return p[0];
+    if (g < 8) {
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < g; i++) { h ^= p[i]; h *= 16777619u; }
+        return (unsigned char) ((h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24)) & 0xFF);
+    }
+    uint64_t acc = 0;
+    for (uint32_t i = 0; i + 8 <= g; i += 8) {
+        uint64_t w; memcpy(&w, p + i, 8);
+        acc = (acc + w) * 0x9E3779B97F4A7C15ULL;
+        acc ^= acc >> 29;
+    }
+    return (unsigned char) (acc >> 56);
+}
+
+static uint64_t act_state_bytes(const ActRegion *r) {
+    if (r->status != 0) return 0;
+    return 2 * (((r->size + r->gran - 1) / r->gran)) + (r->size + ACT_CHUNK - 1) / ACT_CHUNK;
+}
+
+static void cmd_activity(pid_t pid, const char *regionsPath, int samples, int intervalMs,
+                         const char *outPath, long budgetMb, const char *cancelPath) {
+    if (samples < 2) samples = 2;
+    if (intervalMs < 0) intervalMs = 0;
+    if (budgetMb < 4) budgetMb = 4;
+    uint64_t budget = (uint64_t) budgetMb * 1024 * 1024;
+
+    FILE *rf = fopen(regionsPath, "r");
+    if (!rf) { printf("ERR cannot open regions file\n"); return; }
+    ActRegion *reg = calloc(ACT_MAX_REGIONS, sizeof(ActRegion));
+    int n = 0;
+    char line[256];
+    while (n < ACT_MAX_REGIONS && fgets(line, sizeof(line), rf)) {
+        unsigned long long s, e;
+        if (sscanf(line, "%llx %llx", &s, &e) != 2 || e <= s) continue;
+        reg[n].start = s; reg[n].size = e - s; reg[n].gran = 1; n++;
+    }
+    fclose(rf);
+    if (n == 0) { free(reg); printf("ERR no regions\n"); return; }
+
+    setpriority(PRIO_PROCESS, 0, 10); /* background priority: don't compete with the foreground app */
+
+    /* Pick granules: coarsen the most expensive region until everything fits; if even
+     * 64-byte granules don't fit, skip the biggest region (reported, not silent). */
+    for (;;) {
+        uint64_t total = 0; int worst = -1; uint64_t worstB = 0;
+        for (int i = 0; i < n; i++) {
+            uint64_t b = act_state_bytes(&reg[i]); total += b;
+            if (b > worstB) { worstB = b; worst = i; }
+        }
+        if (total <= budget || worst < 0) break;
+        if (reg[worst].gran < 64) reg[worst].gran *= 2;
+        else reg[worst].status = 1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (reg[i].status != 0) continue;
+        reg[i].nGran = (uint32_t) ((reg[i].size + reg[i].gran - 1) / reg[i].gran);
+        uint64_t nChunks = (reg[i].size + ACT_CHUNK - 1) / ACT_CHUNK;
+        reg[i].hash = calloc(reg[i].nGran, 1);
+        reg[i].cnt = calloc(reg[i].nGran, 1);
+        reg[i].valid = calloc((size_t) nChunks, 1);
+        if (!reg[i].hash || !reg[i].cnt || !reg[i].valid) { printf("ERR out of memory\n"); return; }
+    }
+
+    char memPath[64];
+    snprintf(memPath, sizeof(memPath), "/proc/%d/mem", pid);
+    int fd = open(memPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { printf("ERR open mem failed: %s\n", strerror(errno)); return; }
+    unsigned char *buf = malloc(ACT_CHUNK);
+    if (!buf) { close(fd); printf("ERR out of memory\n"); return; }
+
+    int cancelled = 0;
+    for (int s = 0; s < samples && !cancelled; s++) {
+        for (int i = 0; i < n && !cancelled; i++) {
+            ActRegion *r = &reg[i];
+            if (r->status != 0) continue;
+            uint64_t nChunks = (r->size + ACT_CHUNK - 1) / ACT_CHUNK;
+            for (uint64_t c = 0; c < nChunks; c++) {
+                if (cancelPath[0] && access(cancelPath, F_OK) == 0) { cancelled = 1; break; }
+                uint64_t off = c * ACT_CHUNK;
+                size_t len = (size_t) ((r->size - off) < ACT_CHUNK ? (r->size - off) : ACT_CHUNK);
+                if (pread_full(fd, buf, len, r->start + off) != 0) { r->valid[c] = 0; continue; }
+                uint64_t g0 = off / r->gran;
+                uint32_t ng = (uint32_t) ((len + r->gran - 1) / r->gran);
+                int comparable = r->valid[c];
+                for (uint32_t k = 0; k < ng; k++) {
+                    size_t o = (size_t) k * r->gran;
+                    unsigned char h;
+                    if (o + r->gran <= len) h = gran_hash(buf + o, r->gran);
+                    else h = gran_hash(buf + o, 1); /* ragged tail granule: hash its first byte */
+                    if (comparable && r->hash[g0 + k] != h && r->cnt[g0 + k] < 255) r->cnt[g0 + k]++;
+                    r->hash[g0 + k] = h;
+                }
+                r->valid[c] = 1;
+                usleep(300); /* let other apps have the memory bus / CPU */
+            }
+        }
+        printf("P %d %d\n", s + 1, samples);
+        fflush(stdout);
+        if (!cancelled && s < samples - 1 && intervalMs > 0) usleep((useconds_t) intervalMs * 1000);
+    }
+    close(fd);
+    free(buf);
+
+    if (cancelled) { printf("CANCELLED\n"); goto cleanup; }
+
+    int of = open(outPath, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0666);
+    if (of < 0) { printf("ERR cannot open output file: %s\n", strerror(errno)); goto cleanup; }
+    {
+        unsigned char hdr[8] = { 'R', 'T', 'A', '1', 0, 0, 0, 0 };
+        uint32_t nn = (uint32_t) n; memcpy(hdr + 4, &nn, 4);
+        int bad = write_all(of, hdr, 8);
+        for (int i = 0; i < n && !bad; i++) {
+            unsigned char rec[28];
+            memcpy(rec, &reg[i].start, 8); memcpy(rec + 8, &reg[i].size, 8);
+            memcpy(rec + 16, &reg[i].gran, 4); memcpy(rec + 20, &reg[i].nGran, 4);
+            memcpy(rec + 24, &reg[i].status, 4);
+            bad = write_all(of, rec, 28);
+            if (!bad && reg[i].status == 0) bad = write_all(of, reg[i].cnt, reg[i].nGran);
+        }
+        close(of);
+        chmod(outPath, 0666);
+        if (bad) printf("ERR writing output file failed\n"); else printf("DONE\n");
+    }
+cleanup:
+    for (int i = 0; i < n; i++) { free(reg[i].hash); free(reg[i].cnt); free(reg[i].valid); }
+    free(reg);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { printf("ERR missing command\n"); return 1; }
 
@@ -700,6 +903,18 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(argv[1], "readbin") == 0 && argc >= 5) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        cmd_readbin(pid, strtoull(argv[3], NULL, 16), (size_t) strtoull(argv[4], NULL, 10));
+        return 0;
+    }
+    if (strcmp(argv[1], "activity") == 0 && argc >= 9) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        cmd_activity(pid, argv[3], atoi(argv[4]), atoi(argv[5]), argv[6], atol(argv[7]), argv[8]);
+        return 0;
+    }
     if (strcmp(argv[1], "cpatch") == 0 && argc >= 6) {
         pid_t pid = (pid_t) atoi(argv[2]);
         if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
