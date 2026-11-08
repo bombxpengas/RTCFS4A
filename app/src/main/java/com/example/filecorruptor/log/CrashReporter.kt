@@ -15,7 +15,11 @@ data class CrashReport(
     /** One human-readable line, safe to show in a status card. */
     val summary: String,
     val logcat: String,
-    val tombstone: String?
+    val tombstone: String?,
+    /** The allocator/libc abort message, e.g. "Scudo ERROR: corrupted chunk header ...", or null. */
+    val abortMessage: String? = null,
+    /** True when the process aborted because the heap allocator found its own metadata overwritten. */
+    val heapCorruption: Boolean = false
 ) {
     /** The whole thing as one text blob (for the log file / share). */
     fun fullText(): String = buildString {
@@ -45,6 +49,55 @@ object CrashReporter {
     // and the tombstone form ("signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x...").
     private val FATAL_SIGNAL =
         Regex("(?:Fatal signal|signal) (\\d+) \\((\\w+)\\)[^\\n]*?fault addr (0x[0-9a-fA-F]+|-+)")
+
+    private val ABORT_MESSAGE = Regex("Abort message: '(.*)'")
+    private val DEBUG_LINE = Regex("^\\S+\\s+\\S+\\s+\\d+\\s+\\d+\\s+[A-Z]\\s+DEBUG\\s*:")
+
+    private fun isHeapAbort(message: String?): Boolean =
+        message != null && (message.contains("Scudo ERROR") || message.contains("corrupted chunk header"))
+
+    /** Does this logcat (threadtime) line belong to [pid] — by its own pid column or by naming it? */
+    private fun mentionsPid(line: String, pid: Int): Boolean {
+        val cols = line.trim().split(Regex("\\s+"), limit = 6)
+        if (cols.size >= 5 && cols[2] == pid.toString()) return true
+        return line.contains("pid: $pid,") || line.contains("pid $pid)") || line.contains("pid=$pid ") ||
+            line.contains("($pid)") || line.contains(" $pid,")
+    }
+
+    /**
+     * The device-wide crash buffer keeps *old* crashes of other processes — and of earlier
+     * incarnations of this one. Reading it unfiltered is how a process that was merely closed got
+     * reported as "crashed: SIGABRT" from someone else's stale tombstone lines. Keeps only lines
+     * about [pid] (plus whole `DEBUG` tombstone blocks whose header names it). Returns the kept
+     * text and how many unrelated lines were dropped.
+     */
+    internal fun filterForPid(text: String, pid: Int): Pair<String, Int> {
+        val lines = text.lines()
+        val keep = BooleanArray(lines.size)
+        for (i in lines.indices) if (mentionsPid(lines[i], pid)) keep[i] = true
+        var i = 0
+        while (i < lines.size) {
+            if (!DEBUG_LINE.containsMatchIn(lines[i])) { i++; continue }
+            var j = i
+            var mine = false
+            while (j < lines.size && DEBUG_LINE.containsMatchIn(lines[j])) {
+                if (lines[j].contains("pid: $pid,")) mine = true
+                j++
+            }
+            if (mine) for (k in i until j) keep[k] = true
+            i = j
+        }
+        var omitted = 0
+        val kept = ArrayList<String>()
+        for (k in lines.indices) {
+            val l = lines[k]
+            when {
+                keep[k] || l.startsWith("---") -> kept += l
+                l.isNotBlank() -> omitted++
+            }
+        }
+        return kept.joinToString("\n") to omitted
+    }
 
     /**
      * Waits (up to ~3 s) for a process that stopped answering to settle into
@@ -91,11 +144,21 @@ object CrashReporter {
         // debuggerd/tombstoned finish writing the tombstone a moment after the process dies.
         runCatching { Thread.sleep(800) }
 
-        val logcatCmd =
-            "logcat -d -v threadtime -b crash -t 200 2>&1; echo '--- main/system, filtered ---'; " +
-                "logcat -d -v threadtime -b main -b system -t 3000 2>&1 | " +
-                "grep -E 'Fatal signal|DEBUG|libc|am_proc_died|am_crash|Process .* has died|$pid' | tail -n 80"
-        val logcat = RootMemoryHelper.runRootShell(logcatCmd, 25_000L).trim()
+        val rawCrash = RootMemoryHelper.runRootShell("logcat -d -v threadtime -b crash -t 600 2>&1", 25_000L)
+        val rawMain = RootMemoryHelper.runRootShell(
+            "logcat -d -v threadtime -b main -b system -t 4000 2>&1 | " +
+                "grep -E 'Fatal signal|DEBUG|libc|am_proc_died|am_crash|Process .* has died|$pid' | tail -n 400",
+            25_000L
+        )
+        val (crashPart, omittedA) = filterForPid(rawCrash, pid)
+        val (mainPart, omittedB) = filterForPid(rawMain, pid)
+        val omitted = omittedA + omittedB
+        val logcat = buildString {
+            appendLine(crashPart.trim().ifBlank { "(no crash-buffer lines for pid $pid)" })
+            appendLine("--- main/system, filtered to pid $pid ---")
+            appendLine(mainPart.trim())
+            if (omitted > 0) appendLine("($omitted unrelated log line(s) from other processes / older crashes omitted)")
+        }.trim()
 
         // Newest few text tombstones (skip the protobuf .pb twins), first one whose header names this pid.
         val tombCmd =
@@ -108,15 +171,19 @@ object CrashReporter {
         val signal = match?.groupValues?.get(2)
         val fault = match?.groupValues?.get(3)?.takeIf { it.startsWith("0x") }
 
+        val abortMessage = (ABORT_MESSAGE.find(tombstone.orEmpty()) ?: ABORT_MESSAGE.find(logcat))?.groupValues?.get(1)
+        val heapCorruption = isHeapAbort(abortMessage)
+
         val summary = if (match != null) {
             "$processName (pid $pid) crashed: $signal (signal ${match.groupValues[1]})" +
-                (fault?.let { ", fault address $it" } ?: "")
+                (fault?.let { ", fault address $it" } ?: "") +
+                (if (heapCorruption) " — heap allocator aborted on an overwritten chunk header" else "")
         } else {
             "$processName (pid $pid) is gone — no crash signature found (it may have been closed, " +
                 "killed by Android's low-memory killer, or exited on its own)"
         }
 
-        val report = CrashReport(pid, processName, signal, fault, summary, logcat, tombstone)
+        val report = CrashReport(pid, processName, signal, fault, summary, logcat, tombstone, abortMessage, heapCorruption)
 
         RtcLog.e(TAG, summary)
         val saved = RtcLog.saveReport("crash_${processName.replace(Regex("[^A-Za-z0-9._-]"), "_")}", report.fullText())

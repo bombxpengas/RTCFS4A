@@ -33,6 +33,25 @@ data class MemoryRegion(val start: Long, val end: Long, val perms: String, val p
 /** One small write inside a process: [bytes] go to absolute [address]. */
 class MemoryPatch(val address: Long, val bytes: ByteArray)
 
+/**
+ * A compare-and-swap write: [bytes] replace what is at [address] only if the
+ * target's memory there STILL equals [expected] (the snapshot the patch was
+ * computed from). Both arrays have the same length.
+ */
+class CheckedPatch(val address: Long, val expected: ByteArray, val bytes: ByteArray)
+
+/** Outcome of [RootMemoryHelper.patchMemoryChecked]. [error] != null means nothing was written. */
+data class PatchResult(
+    val error: String? = null,
+    val applied: Int = 0,
+    /** Memory no longer matched the snapshot (the app freed/re-used/rewrote it): left alone. */
+    val skipped: Int = 0,
+    /** The range was no longer mapped read/write: left alone. */
+    val unmapped: Int = 0,
+    val failed: Int = 0,
+    val threadsFrozen: Int = 0
+)
+
 enum class ProcState { ALIVE, STOPPED, DEAD, UNKNOWN }
 
 /**
@@ -255,6 +274,60 @@ object RootMemoryHelper {
             )
             val first = result.firstOrNull()?.trim()
             if (first == "OK") null else (first ?: "no output from helper")
+        } finally {
+            inFile.delete()
+        }
+    }
+
+    /**
+     * The safest write path: freezes every thread of [pid], then applies each
+     * [CheckedPatch] only where memory still equals the snapshot. See `cpatch`
+     * in rtmem_helper.c. Falls back to the plain single-attach path if the
+     * installed helper predates `cpatch`.
+     */
+    fun patchMemoryChecked(
+        context: Context,
+        pid: Int,
+        regionStart: Long,
+        regionEnd: Long,
+        patches: List<CheckedPatch>
+    ): PatchResult {
+        if (patches.isEmpty()) return PatchResult()
+        val total = patches.sumOf { 12 + it.expected.size + it.bytes.size }
+        val buf = ByteBuffer.allocate(total).order(ByteOrder.LITTLE_ENDIAN)
+        for (p in patches) {
+            buf.putLong(p.address)
+            buf.putInt(p.bytes.size)
+            buf.put(p.expected)
+            buf.put(p.bytes)
+        }
+        val inFile = File(context.cacheDir, "rtmem_cpatch_${System.nanoTime()}.bin")
+        return try {
+            inFile.writeBytes(buf.array())
+            val result = runAsRoot(
+                context, "cpatch", pid.toString(),
+                regionStart.toString(16), regionEnd.toString(16), inFile.absolutePath
+            )
+            val first = result.firstOrNull()?.trim()
+            when {
+                first == null -> PatchResult(error = "no output from helper")
+                first.startsWith("ERR unknown command") -> {
+                    RtcLog.w(TAG, "helper has no cpatch — using the plain patch path")
+                    val err = patchMemory(context, pid, regionStart, regionEnd, patches.map { MemoryPatch(it.address, it.bytes) })
+                    PatchResult(error = err, applied = if (err == null) patches.size else 0)
+                }
+                first.startsWith("OK") -> {
+                    val kv = Regex("(\\w+)=(\\d+)").findAll(first).associate { it.groupValues[1] to it.groupValues[2].toInt() }
+                    PatchResult(
+                        applied = kv["applied"] ?: 0,
+                        skipped = kv["skipped"] ?: 0,
+                        unmapped = kv["unmapped"] ?: 0,
+                        failed = kv["failed"] ?: 0,
+                        threadsFrozen = kv["frozen"] ?: 0
+                    )
+                }
+                else -> PatchResult(error = first)
+            }
         } finally {
             inFile.delete()
         }

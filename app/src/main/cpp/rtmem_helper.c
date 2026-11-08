@@ -38,6 +38,24 @@
  *          region since it was scanned, this refuses instead of scribbling
  *          over whatever now lives at that address (usually a crash).
  *
+ *   rtmem_helper cpatch <pid> <hex_region_start> <hex_region_end> <patch_file>
+ *       -> the safest write path (used by Anti-crash). Like `patch`, but:
+ *          (1) it FREEZES EVERY THREAD of the target (PTRACE_SEIZE +
+ *          PTRACE_INTERRUPT on each /proc/<pid>/task/<tid>), not just the
+ *          main one. A game keeps allocating/freeing on its other threads
+ *          while a single-thread attach is held, so the snapshot we corrupted
+ *          can be stale by the time we write; (2) every record carries the
+ *          bytes we *expect* to find (the snapshot) followed by the new
+ *          bytes, and a record is only written if the target's memory STILL
+ *          equals the expectation — compare-and-swap. A block the app
+ *          freed, re-allocated or rewrote since the snapshot is skipped, never
+ *          scribbled over; (3) each record is checked against the current
+ *          maps individually, so one unmapped hole in a big region no longer
+ *          cancels the whole write.
+ *          Record: u64 address (LE), u32 length (LE), <length> expected
+ *          bytes, <length> new bytes.
+ *          Prints: OK applied=N skipped=N unmapped=N failed=N frozen=N
+ *
  *   rtmem_helper alive <pid> <name>
  *       -> ALIVE | STOPPED | DEAD [reason]. <name> must match the pid's
  *          argv[0], so a recycled pid is reported as DEAD, not ALIVE.
@@ -389,6 +407,256 @@ static void cmd_patch(pid_t pid, uint64_t regionStart, uint64_t regionEnd, const
     printf("OK\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* cpatch: freeze all threads + compare-and-swap writes                 */
+/* ------------------------------------------------------------------ */
+
+#ifndef PTRACE_SEIZE
+#define PTRACE_SEIZE 0x4206
+#endif
+#ifndef PTRACE_INTERRUPT
+#define PTRACE_INTERRUPT 0x4207
+#endif
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
+#endif
+
+#define MAX_TIDS 4096
+
+typedef struct {
+    pid_t tid;
+    int sig;  /* a real signal the thread was already stopped on: re-deliver on detach */
+    int ok;   /* 1 = actually stopped by us (only these get detached) */
+} Tracee;
+
+typedef struct {
+    Tracee t[MAX_TIDS];
+    int n;
+} TraceeSet;
+
+static int set_has(const TraceeSet *s, pid_t tid) {
+    for (int i = 0; i < s->n; i++) if (s->t[i].tid == tid) return 1;
+    return 0;
+}
+
+/* Stops one thread. SEIZE + INTERRUPT (rather than ATTACH's SIGSTOP) means no
+ * group-stop is left behind and an interrupted syscall is restarted cleanly
+ * on detach. Returns 0 when stopped, -1 (errno set) otherwise. */
+static int freeze_thread(pid_t tid, int *sigOut) {
+    *sigOut = 0;
+    if (ptrace(PTRACE_SEIZE, tid, NULL, NULL) != 0) return -1;
+    if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) != 0) {
+        int e = errno;
+        ptrace(PTRACE_DETACH, tid, NULL, NULL);
+        errno = e;
+        return -1;
+    }
+    for (int i = 0; i < 4000; i++) { /* ~2 s at most per thread */
+        int status = 0;
+        pid_t w = waitpid(tid, &status, __WALL | WNOHANG);
+        if (w == tid) {
+            if (!WIFSTOPPED(status)) { errno = ESRCH; return -1; } /* it exited */
+            int sig = WSTOPSIG(status);
+            /* A plain signal-delivery-stop (e.g. the SIGSEGV/SIGABRT it was about
+             * to die from) must be handed back on detach, never swallowed. An
+             * event-stop (our own INTERRUPT) carries nothing to re-deliver. */
+            if ((status >> 16) == 0 && sig != SIGTRAP) *sigOut = sig;
+            return 0;
+        }
+        if (w < 0 && errno != EINTR) return -1;
+        usleep(500);
+    }
+    /* Never stopped (uninterruptible sleep). We can't detach a running
+     * tracee; the kernel releases it when this helper exits a moment later. */
+    errno = ETIMEDOUT;
+    return -1;
+}
+
+static int list_tids(pid_t pid, pid_t *out, int max) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < max) {
+        pid_t tid = (pid_t) atoi(e->d_name);
+        if (tid > 0) out[n++] = tid;
+    }
+    closedir(d);
+    return n;
+}
+
+/* Freezes the whole process. The main thread MUST stop (else -1, errno set —
+ * EPERM here means debuggerd/crash_dump already owns the process, i.e. it is
+ * mid-crash); other threads are best effort. New threads spawned while we
+ * were stopping the others are picked up by re-listing until a pass adds none. */
+static int freeze_all(pid_t pid, TraceeSet *set) {
+    set->n = 0;
+    int sig = 0;
+    if (freeze_thread(pid, &sig) != 0) return -1;
+    set->t[set->n].tid = pid; set->t[set->n].sig = sig; set->t[set->n].ok = 1; set->n++;
+
+    pid_t tids[MAX_TIDS];
+    for (int pass = 0; pass < 8; pass++) {
+        int n = list_tids(pid, tids, MAX_TIDS);
+        int added = 0;
+        for (int i = 0; i < n && set->n < MAX_TIDS; i++) {
+            if (set_has(set, tids[i])) continue;
+            int ok = (freeze_thread(tids[i], &sig) == 0);
+            set->t[set->n].tid = tids[i];
+            set->t[set->n].sig = ok ? sig : 0;
+            set->t[set->n].ok = ok;
+            set->n++;
+            added++;
+        }
+        if (added == 0) break;
+    }
+    return 0;
+}
+
+static int frozen_count(const TraceeSet *set) {
+    int c = 0;
+    for (int i = 0; i < set->n; i++) c += set->t[i].ok;
+    return c;
+}
+
+static void thaw_all(TraceeSet *set) {
+    /* Others first, main thread last. */
+    for (int i = set->n - 1; i >= 0; i--) {
+        if (!set->t[i].ok) continue;
+        ptrace(PTRACE_DETACH, set->t[i].tid, NULL, (void *)(long) set->t[i].sig);
+    }
+}
+
+typedef struct { uint64_t s, e; } Range;
+
+/* Reads the target's CURRENT plain read/write (non-exec) mappings, merging
+ * adjacent ones. Returns the count; *out is malloc'd (caller frees). */
+static int load_rw_ranges(pid_t pid, Range **out) {
+    *out = NULL;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int cap = 256, n = 0;
+    Range *r = malloc(sizeof(Range) * cap);
+    if (!r) { fclose(f); return 0; }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long s, e;
+        char perms[8];
+        if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || perms[2] == 'x') continue;
+        if (n > 0 && r[n - 1].e == (uint64_t) s) { r[n - 1].e = (uint64_t) e; continue; }
+        if (n == cap) {
+            cap *= 2;
+            Range *nr = realloc(r, sizeof(Range) * cap);
+            if (!nr) break;
+            r = nr;
+        }
+        r[n].s = (uint64_t) s; r[n].e = (uint64_t) e; n++;
+    }
+    fclose(f);
+    *out = r;
+    return n;
+}
+
+static int range_covered(const Range *r, int n, uint64_t addr, uint64_t len) {
+    uint64_t end = addr + len;
+    if (end < addr) return 0;
+    for (int i = 0; i < n; i++) {
+        if (r[i].s <= addr && end <= r[i].e) return 1;
+    }
+    return 0;
+}
+
+static void cmd_cpatch(pid_t pid, uint64_t regionStart, uint64_t regionEnd, const char *patchPath) {
+    if (regionEnd <= regionStart) { printf("ERR bad region\n"); return; }
+
+    size_t size = 0;
+    const char *err = NULL;
+    unsigned char *buf = slurp(patchPath, &size, &err);
+    if (!buf) { printf("ERR patch file: %s\n", err); return; }
+
+    /* Validate the whole file BEFORE freezing anything. */
+    size_t pos = 0;
+    uint32_t maxLen = 0;
+    while (pos < size) {
+        if (size - pos < 12) { free(buf); printf("ERR truncated patch record\n"); return; }
+        uint64_t addr; uint32_t len;
+        memcpy(&addr, buf + pos, 8);
+        memcpy(&len, buf + pos + 8, 4);
+        pos += 12;
+        if (len == 0 || (uint64_t) len * 2 > size - pos) { free(buf); printf("ERR bad patch length\n"); return; }
+        if (addr < regionStart || addr > regionEnd || (uint64_t) len > regionEnd - addr) {
+            free(buf);
+            printf("ERR patch outside region 0x%" PRIx64 "-0x%" PRIx64 "\n", regionStart, regionEnd);
+            return;
+        }
+        if (len > maxLen) maxLen = len;
+        pos += (size_t) len * 2;
+    }
+
+    unsigned char *cur = malloc(maxLen ? maxLen : 1);
+    TraceeSet *set = calloc(1, sizeof(TraceeSet));
+    if (!cur || !set) { free(buf); free(cur); free(set); printf("ERR out of memory\n"); return; }
+
+    if (freeze_all(pid, set) != 0) {
+        int e = errno;
+        free(buf); free(cur); free(set);
+        printf("ERR attach failed: %s\n", strerror(e));
+        return;
+    }
+
+    Range *ranges = NULL;
+    int nRanges = load_rw_ranges(pid, &ranges);
+
+    char memPath[64];
+    snprintf(memPath, sizeof(memPath), "/proc/%d/mem", pid);
+    int fd = open(memPath, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        int e = errno;
+        thaw_all(set);
+        free(buf); free(cur); free(set); free(ranges);
+        printf("ERR open mem failed: %s\n", strerror(e));
+        return;
+    }
+
+    int applied = 0, skipped = 0, unmapped = 0, failed = 0;
+    uint64_t failAddr = 0; int failErr = 0;
+    pos = 0;
+    while (pos < size) {
+        uint64_t addr; uint32_t len;
+        memcpy(&addr, buf + pos, 8);
+        memcpy(&len, buf + pos + 8, 4);
+        pos += 12;
+        const unsigned char *expected = buf + pos;
+        const unsigned char *fresh = buf + pos + len;
+        pos += (size_t) len * 2;
+
+        if (!range_covered(ranges, nRanges, addr, len)) { unmapped++; continue; }
+        if (pread_full(fd, cur, len, addr) != 0) { skipped++; continue; }
+        if (memcmp(cur, expected, len) != 0) { skipped++; continue; } /* the app changed it since the snapshot */
+        if (pwrite_full(fd, fresh, len, addr) != 0) {
+            if (!failed) { failAddr = addr; failErr = errno; }
+            failed++;
+            continue;
+        }
+        applied++;
+    }
+    close(fd);
+    int frozen = frozen_count(set);
+    thaw_all(set);
+    free(buf); free(cur); free(set); free(ranges);
+
+    if (applied == 0 && failed > 0) {
+        printf("ERR write failed at 0x%" PRIx64 ": %s\n", failAddr, strerror(failErr));
+        return;
+    }
+    printf("OK applied=%d skipped=%d unmapped=%d failed=%d frozen=%d\n", applied, skipped, unmapped, failed, frozen);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { printf("ERR missing command\n"); return 1; }
 
@@ -429,6 +697,15 @@ int main(int argc, char **argv) {
         uint64_t rs = strtoull(argv[3], NULL, 16);
         uint64_t re = strtoull(argv[4], NULL, 16);
         cmd_patch(pid, rs, re, argv[5]);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "cpatch") == 0 && argc >= 6) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        uint64_t rs = strtoull(argv[3], NULL, 16);
+        uint64_t re = strtoull(argv[4], NULL, 16);
+        cmd_cpatch(pid, rs, re, argv[5]);
         return 0;
     }
 

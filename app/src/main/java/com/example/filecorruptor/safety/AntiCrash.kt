@@ -6,6 +6,7 @@ import com.example.filecorruptor.log.RtcLog
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.File
 
 /**
@@ -28,9 +29,16 @@ import java.io.File
  *    fields it just changed (half-updated pointers, lengths, refcounts).
  *    Writing only the bytes that actually changed shrinks that window to
  *    nearly nothing.
- *  - **Learned** bad spots: when a target dies, the areas touched just before
- *    are "struck"; an area implicated in two separate crashes is quarantined
- *    and left alone from then on.
+ *  - **Allocator headers** ([ScudoGuard]): the field logs showed every crash was
+ *    Scudo aborting on a corrupted chunk header when the app later freed the
+ *    block. Those headers are recognised by shape and never written.
+ *  - **Compare-and-swap writes**: the helper freezes *all* the target's threads
+ *    and only writes a patch if memory still equals the snapshot it was
+ *    computed from, so churn between read and write can't turn into damage.
+ *  - **Learned** bad spots, for *stable* mappings only (files/libraries): when a
+ *    target dies, the areas touched just before are "struck"; an area implicated
+ *    in two separate crashes is quarantined. Heap memory is never learned from —
+ *    its layout is different on every launch, so an offset means nothing next run.
  */
 object AntiCrash {
 
@@ -51,8 +59,32 @@ object AntiCrash {
         /** RAM: leave areas implicated in repeated crashes alone. */
         val quarantine: Boolean = true,
         /** RAM: stop live corrupting the moment a target dies. */
-        val stopOnCrash: Boolean = true
+        val stopOnCrash: Boolean = true,
+        /** RAM: never overwrite Scudo allocator chunk headers (the cause of every logged crash). */
+        val heapGuard: Boolean = true,
+        /** RAM: freeze all target threads and only write where memory still matches the snapshot. */
+        val verifyBeforeWrite: Boolean = true,
+        /** RAM: refuse stacks/TLS, vDSO, linker bookkeeping and the system-property area. */
+        val blockSystemRegions: Boolean = true
     )
+
+    /** Running totals, for the Logs screen. */
+    data class Stats(
+        /** Allocator header words / prefix bytes left untouched. */
+        val headersProtected: Long = 0,
+        /** Patches skipped because the target changed that memory after our snapshot. */
+        val stalePatchesSkipped: Long = 0,
+        /** Targets that died on an allocator-header abort (i.e. the guard missed something). */
+        val heapAborts: Int = 0
+    )
+
+    private val _stats = MutableStateFlow(Stats())
+    val stats: StateFlow<Stats> = _stats.asStateFlow()
+
+    fun addProtection(headers: Int, stalePatches: Int) {
+        if (headers == 0 && stalePatches == 0) return
+        _stats.update { it.copy(headersProtected = it.headersProtected + headers, stalePatchesSkipped = it.stalePatchesSkipped + stalePatches) }
+    }
 
     private val _config = MutableStateFlow(Config())
     val config: StateFlow<Config> = _config.asStateFlow()
@@ -73,7 +105,10 @@ object AntiCrash {
             pointerShield = p.getBoolean("pointerShield", d.pointerShield),
             minimalPatches = p.getBoolean("minimalPatches", d.minimalPatches),
             quarantine = p.getBoolean("quarantine", d.quarantine),
-            stopOnCrash = p.getBoolean("stopOnCrash", d.stopOnCrash)
+            stopOnCrash = p.getBoolean("stopOnCrash", d.stopOnCrash),
+            heapGuard = p.getBoolean("heapGuard", d.heapGuard),
+            verifyBeforeWrite = p.getBoolean("verifyBeforeWrite", d.verifyBeforeWrite),
+            blockSystemRegions = p.getBoolean("blockSystemRegions", d.blockSystemRegions)
         )
         RtcLog.verboseToFile = p.getBoolean("verboseLog", false)
         quarantineFile = File(app.filesDir, "quarantine.tsv")
@@ -91,6 +126,9 @@ object AntiCrash {
             ?.putBoolean("minimalPatches", newConfig.minimalPatches)
             ?.putBoolean("quarantine", newConfig.quarantine)
             ?.putBoolean("stopOnCrash", newConfig.stopOnCrash)
+            ?.putBoolean("heapGuard", newConfig.heapGuard)
+            ?.putBoolean("verifyBeforeWrite", newConfig.verifyBeforeWrite)
+            ?.putBoolean("blockSystemRegions", newConfig.blockSystemRegions)
             ?.apply()
         RtcLog.i(TAG, "config changed: $newConfig")
     }
@@ -194,6 +232,23 @@ object AntiCrash {
 
         val isEmpty: Boolean get() = starts.isEmpty()
 
+        /** True if every byte of [from, to) is inside some mapping (adjacent mappings count as one). */
+        fun coversRange(from: Long, to: Long): Boolean {
+            var cursor = from
+            while (cursor < to) {
+                var lo = 0
+                var hi = starts.size - 1
+                var idx = -1
+                while (lo <= hi) {
+                    val mid = (lo + hi) ushr 1
+                    if (starts[mid] <= cursor) { idx = mid; lo = mid + 1 } else hi = mid - 1
+                }
+                if (idx < 0 || cursor >= ends[idx]) return false
+                cursor = ends[idx]
+            }
+            return true
+        }
+
         fun contains(value: Long): Boolean {
             var lo = 0
             var hi = starts.size - 1
@@ -295,6 +350,16 @@ object AntiCrash {
     fun targetKey(processName: String, region: MemoryRegion): String =
         "$processName|${region.path}|${region.size}"
 
+    /**
+     * Only mappings whose layout survives a relaunch can be learned from:
+     * a named file (a library's .data/.bss, an asset). Anonymous memory — the
+     * heap above all — is laid out differently every launch, so "offset X
+     * crashed last time" says nothing about the next run. (In the logs the
+     * quarantine grew 8 -> 24 -> 32 areas and never prevented a single crash.)
+     */
+    fun isLearnable(region: MemoryRegion): Boolean =
+        region.path.isNotEmpty() && !region.path.startsWith("[")
+
     /** Remember which areas this cycle touched, so a crash right after can be attributed. */
     fun recordCycle(key: String, patches: List<Patch>) {
         if (patches.isEmpty()) return
@@ -340,7 +405,20 @@ object AntiCrash {
      * (implicated in two separate crashes) is quarantined from then on.
      * Returns the number of areas newly quarantined.
      */
-    fun onProcessCrashed(processName: String): Int {
+    fun onProcessCrashed(processName: String, heapAbort: Boolean = false): Int {
+        if (heapAbort) {
+            // Known cause: the allocator found one of its headers overwritten. The write
+            // that did it may be minutes old, so striking "recent" areas would blame the
+            // wrong bytes; just forget this incarnation's history.
+            synchronized(quarantineLock) { recentCycles.keys.removeAll { it.startsWith("$processName|") } }
+            _stats.update { it.copy(heapAborts = it.heapAborts + 1) }
+            RtcLog.w(
+                TAG,
+                "$processName aborted on a corrupted allocator header — the guard did not cover that word " +
+                    "(over-aligned/unusual chunk, or written while Heap guard was off). No areas struck."
+            )
+            return 0
+        }
         var newlyQuarantined = 0
         var changed = false
         synchronized(quarantineLock) {

@@ -121,6 +121,7 @@ object LiveSession {
                 try {
                     val r = runCycle()
                     if (r.deadPids.isNotEmpty()) removeTargets(r.deadPids)
+                    if (r.goneTargets.isNotEmpty()) removeGone(r.goneTargets)
                     setMessage(
                         when {
                             r.failed == 0 -> "Corrupted all ${r.succeeded} target(s) once."
@@ -189,6 +190,11 @@ object LiveSession {
         setTargets(targets.filterNot { it.process.pid in deadPids })
     }
 
+    /** Drops targets whose region the app has unmapped (normal for heap memory). */
+    private fun removeGone(gone: List<LiveTarget>) {
+        setTargets(targets.filterNot { t -> gone.any { it === t } })
+    }
+
     private fun finishWithMessage(text: String, isError: Boolean) {
         _state.update { it.copy(running = false) }
         setMessage(text, isError)
@@ -198,6 +204,7 @@ object LiveSession {
     private fun tickOnce(): Boolean {
         val r = runCycle()
         val ticks = _state.value.ticks
+        if (r.goneTargets.isNotEmpty()) removeGone(r.goneTargets)
         if (r.deadPids.isNotEmpty()) {
             removeTargets(r.deadPids)
             // Stop right away so we never keep hammering a relaunched process
@@ -211,14 +218,20 @@ object LiveSession {
         if (r.succeeded == 0) {
             val why = r.lastError ?: "no targets left"
             RtcLog.w(TAG, "stopped after $ticks tick(s): every target failed — $why")
-            finishWithMessage("Live corrupting stopped — $why", r.failed > 0)
+            finishWithMessage("Live corrupting stopped — $why", r.failed > 0 || r.goneTargets.isNotEmpty())
             return false
         }
         _state.update { it.copy(ticks = it.ticks + 1) }
         return true
     }
 
-    private class CycleResult(val succeeded: Int, val failed: Int, val lastError: String?, val deadPids: Set<Int>)
+    private class CycleResult(
+        val succeeded: Int,
+        val failed: Int,
+        val lastError: String?,
+        val deadPids: Set<Int>,
+        val goneTargets: List<LiveTarget> = emptyList()
+    )
 
     /**
      * One pass over every target. One target's failure (OOM on a huge region,
@@ -238,10 +251,19 @@ object LiveSession {
         var lastError: String? = null
         var lastSeed: Long? = null
         val dead = mutableSetOf<Int>()
+        val gone = mutableListOf<LiveTarget>()
+        var skippedDead = 0
         for (t in current) {
+            // One process can own many targets. Once it is known dead, don't hammer it (and the
+            // log) once per remaining target — the old behaviour printed ~100 identical lines.
+            if (t.process.pid in dead) { skippedDead++; continue }
             try {
                 lastSeed = LiveCorruptor.corruptTarget(ctx, t.process, t.region, eng, snapshot).seedUsed
                 succeeded++
+            } catch (e: LiveCorruptor.RegionGoneException) {
+                gone += t
+                lastError = e.message
+                RtcLog.i(TAG, "${t.process.name}: ${e.message}")
             } catch (e: Throwable) { // includes OutOfMemoryError: one huge region must not kill the loop
                 failed++
                 if (e is LiveCorruptor.TargetDiedException) dead += t.process.pid
@@ -256,6 +278,7 @@ object LiveSession {
         lastSeed?.let { seed ->
             if (vals.containsKey("lastSeedUsed")) vals["lastSeedUsed"] = ParamValue.of(seed.toString())
         }
-        return CycleResult(succeeded, failed, lastError, dead)
+        if (skippedDead > 0) RtcLog.d(TAG, "skipped $skippedDead more target(s) of the dead process")
+        return CycleResult(succeeded, failed, lastError, dead, gone)
     }
 }

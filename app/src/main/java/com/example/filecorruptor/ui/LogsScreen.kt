@@ -34,6 +34,7 @@ fun LogsScreen() {
     val clipboard = LocalClipboardManager.current
 
     val config by AntiCrash.config.collectAsState()
+    val stats by AntiCrash.stats.collectAsState()
     val entries by RtcLog.entries.collectAsState()
 
     var minLevel by remember { mutableStateOf(RtcLog.Level.INFO) }
@@ -109,6 +110,21 @@ fun LogsScreen() {
                 ) { AntiCrash.update(config.copy(blockExecutable = it)) }
 
                 ToggleRow(
+                    "Block system regions",
+                    "Live RAM: refuses stacks/TLS, vDSO, linker bookkeeping and the system-property area — always a crash, never a glitch.",
+                    config.blockSystemRegions,
+                    enabled = config.enabled
+                ) { AntiCrash.update(config.copy(blockSystemRegions = it)) }
+
+                ToggleRow(
+                    "Heap guard (Scudo headers)",
+                    "Live RAM: never overwrites the allocator's chunk headers in scudo heap regions. Every crash in the logs was " +
+                        "\"Scudo ERROR: corrupted chunk header\" (SIGABRT) — it fires later, when the app frees the block.",
+                    config.heapGuard,
+                    enabled = config.enabled
+                ) { AntiCrash.update(config.copy(heapGuard = it)) }
+
+                ToggleRow(
                     "Pointer shield",
                     "Live RAM: never overwrites a value that points into the app's own memory — the #1 cause of SIGSEGV.",
                     config.pointerShield,
@@ -124,8 +140,17 @@ fun LogsScreen() {
                 ) { AntiCrash.update(config.copy(minimalPatches = it)) }
 
                 ToggleRow(
+                    "Verify before write (freeze + compare)",
+                    "Live RAM: freezes every thread of the target while writing, and skips any patch whose memory the app " +
+                        "changed since the snapshot (freed, re-allocated, rewritten). Brief hitch per tick.",
+                    config.verifyBeforeWrite,
+                    enabled = config.enabled && config.minimalPatches
+                ) { AntiCrash.update(config.copy(verifyBeforeWrite = it)) }
+
+                ToggleRow(
                     "Learn from crashes (quarantine)",
-                    "Live RAM: an area touched right before two separate crashes is left alone from then on.",
+                    "Live RAM: for file-backed memory only (libraries/assets), an area touched right before two separate " +
+                        "crashes is left alone. Heap memory is never learned from — its layout changes every launch.",
                     config.quarantine,
                     enabled = config.enabled
                 ) { AntiCrash.update(config.copy(quarantine = it)) }
@@ -136,6 +161,13 @@ fun LogsScreen() {
                     config.stopOnCrash,
                     enabled = config.enabled
                 ) { AntiCrash.update(config.copy(stopOnCrash = it)) }
+
+                Text(
+                    "Heap headers protected: ${stats.headersProtected}   ·   stale patches skipped: ${stats.stalePatchesSkipped}" +
+                        "   ·   allocator aborts: ${stats.heapAborts}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
                 Row(
                     Modifier.fillMaxWidth(),
