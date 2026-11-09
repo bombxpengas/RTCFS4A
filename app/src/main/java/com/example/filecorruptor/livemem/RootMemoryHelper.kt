@@ -503,4 +503,66 @@ object RootMemoryHelper {
     }
 
     private const val ACTIVITY_STALL_MS = 120_000L
+
+    /** Final result of a streaming helper run (`vscan` / `vnext`). */
+    class HelperRun(val count: Int, val truncated: Boolean, val cancelled: Boolean)
+
+    /**
+     * Runs a long helper command and follows its output: "P <a> <b>" lines go to [onProgress],
+     * "DONE <count> <truncated>" ends it, "ERR ..." throws. [isCancelled] is polled with every progress
+     * line; cancelling creates [cancelFile], which the helper checks between chunks. Blocking.
+     */
+    fun runStreamingHelper(
+        context: Context,
+        args: List<String>,
+        cancelFile: File,
+        onProgress: (Long, Long) -> Unit,
+        isCancelled: () -> Boolean
+    ): HelperRun {
+        val process = ProcessBuilder("su", "-c", buildCommand(context, args)).redirectErrorStream(true).start()
+        val last = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+        val watchdog = Thread {
+            try {
+                while (process.isAlive) {
+                    Thread.sleep(1000)
+                    if (System.currentTimeMillis() - last.get() > ACTIVITY_STALL_MS) { process.destroyForcibly(); break }
+                }
+            } catch (_: InterruptedException) {}
+        }.apply { isDaemon = true; start() }
+        var count = 0
+        var truncated = false
+        var done = false
+        var cancelled = false
+        var error: String? = null
+        try {
+            process.inputStream.bufferedReader().use { r ->
+                while (true) {
+                    val line = r.readLine() ?: break
+                    last.set(System.currentTimeMillis())
+                    when {
+                        line.startsWith("P ") -> {
+                            val parts = line.split(" ")
+                            onProgress(parts.getOrNull(1)?.toLongOrNull() ?: 0L, parts.getOrNull(2)?.toLongOrNull() ?: 0L)
+                            if (!cancelled && isCancelled()) { cancelled = true; cancelFile.writeText("x") }
+                        }
+                        line.startsWith("DONE") -> {
+                            val parts = line.split(" ")
+                            count = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                            truncated = parts.getOrNull(2) == "1"
+                            done = true
+                        }
+                        line == "CANCELLED" -> cancelled = true
+                        line.startsWith("ERR") -> error = line
+                    }
+                }
+            }
+        } finally {
+            watchdog.interrupt()
+            if (process.isAlive) process.destroyForcibly()
+            cancelFile.delete()
+        }
+        if (error != null) throw IllegalStateException(error)
+        if (!done && !cancelled) throw IllegalStateException("the search helper stopped before finishing (it may have been killed)")
+        return HelperRun(count, truncated, cancelled)
+    }
 }

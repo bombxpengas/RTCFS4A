@@ -79,6 +79,18 @@
  *          u64 size, u32 granule, u32 nGranules, u32 status (0 ok,
  *          1 skipped: over budget), then nGranules counter bytes if ok.
  *
+ *   rtmem_helper vscan <pid> <regions_file> <type> <value> <out_file> <max_results> <cancel_file>
+ *   rtmem_helper vnext <pid> <in_file> <type> <filter> <value> <out_file> <cancel_file>
+ *       -> "value search" (the Cheat-Engine workflow). vscan finds every aligned
+ *          occurrence of <value> in the listed regions; vnext re-reads the
+ *          addresses from a previous result file and keeps only those that now
+ *          satisfy <filter> (exact | changed | unchanged | increased |
+ *          decreased | all). type: i8 i16 i32 i64 f32 f64. Native, streaming,
+ *          niced, never stops the target; memory use is one chunk no matter
+ *          how big the regions are (results go to <out_file>: "RTV1", u32
+ *          count, then u64 address + u64 raw value per hit). Progress lines
+ *          "P <done> <total>", finishing with "DONE <count> <truncated>".
+ *
  *   rtmem_helper alive <pid> <name>
  *       -> ALIVE | STOPPED | DEAD [reason]. <name> must match the pid's
  *          argv[0], so a recycled pid is reported as DEAD, not ALIVE.
@@ -860,6 +872,243 @@ cleanup:
     free(reg);
 }
 
+/* ------------------------------------------------------------------ */
+/* vscan / vnext: value search                                          */
+/* ------------------------------------------------------------------ */
+
+#include <math.h>
+
+typedef struct { int size; int isFloat; } VType;
+
+static int parse_vtype(const char *s, VType *t) {
+    if (!strcmp(s, "i8"))  { t->size = 1; t->isFloat = 0; return 0; }
+    if (!strcmp(s, "i16")) { t->size = 2; t->isFloat = 0; return 0; }
+    if (!strcmp(s, "i32")) { t->size = 4; t->isFloat = 0; return 0; }
+    if (!strcmp(s, "i64")) { t->size = 8; t->isFloat = 0; return 0; }
+    if (!strcmp(s, "f32")) { t->size = 4; t->isFloat = 1; return 0; }
+    if (!strcmp(s, "f64")) { t->size = 8; t->isFloat = 1; return 0; }
+    return -1;
+}
+
+/* Decodes the value at p as a signed integer or a double. */
+static void vload(const VType *t, const unsigned char *p, int64_t *i, double *d) {
+    if (t->isFloat) {
+        if (t->size == 4) { float f; memcpy(&f, p, 4); *d = f; }
+        else { double x; memcpy(&x, p, 8); *d = x; }
+        *i = 0;
+    } else {
+        switch (t->size) {
+            case 1: { int8_t v;  memcpy(&v, p, 1); *i = v; break; }
+            case 2: { int16_t v; memcpy(&v, p, 2); *i = v; break; }
+            case 4: { int32_t v; memcpy(&v, p, 4); *i = v; break; }
+            default: { int64_t v; memcpy(&v, p, 8); *i = v; break; }
+        }
+        *d = (double) *i;
+    }
+}
+
+typedef struct {
+    VType t;
+    int64_t ival;   /* target, integer types */
+    double dval;    /* target, float types */
+    double tol;     /* float comparison tolerance */
+} VTarget;
+
+static int parse_vtarget(const VType *t, const char *s, VTarget *out) {
+    out->t = *t;
+    char *end = NULL;
+    errno = 0;
+    if (t->isFloat) {
+        double d = strtod(s, &end);
+        if (end == s || *end != '\0' || !isfinite(d)) return -1;
+        out->dval = (t->size == 4) ? (double) (float) d : d;
+        out->tol = (t->size == 4) ? fabs(out->dval) * 1e-6 + 1e-6 : fabs(out->dval) * 1e-12 + 1e-12;
+        out->ival = 0;
+    } else {
+        long long v = strtoll(s, &end, 10);
+        if (end == s || *end != '\0' || errno != 0) return -1;
+        int64_t iv = v;
+        /* wrap into the type's range the way the app would store it */
+        switch (t->size) {
+            case 1: iv = (int8_t) iv; break;
+            case 2: iv = (int16_t) iv; break;
+            case 4: iv = (int32_t) iv; break;
+            default: break;
+        }
+        out->ival = iv; out->dval = 0; out->tol = 0;
+    }
+    return 0;
+}
+
+static inline int vmatch_exact(const VTarget *g, const unsigned char *p) {
+    int64_t i; double d;
+    vload(&g->t, p, &i, &d);
+    if (g->t.isFloat) return isfinite(d) && fabs(d - g->dval) <= g->tol;
+    return i == g->ival;
+}
+
+typedef struct { FILE *f; uint32_t count; uint32_t max; int truncated; } VOut;
+
+static int vout_add(VOut *o, uint64_t addr, const unsigned char *p, int size) {
+    if (o->count >= o->max) { o->truncated = 1; return -1; }
+    unsigned char rec[16] = {0};
+    memcpy(rec, &addr, 8);
+    memcpy(rec + 8, p, size);
+    if (fwrite(rec, 16, 1, o->f) != 1) return -1;
+    o->count++;
+    return 0;
+}
+
+static int vout_open(VOut *o, const char *path, uint32_t max) {
+    o->f = fopen(path, "wb");
+    if (!o->f) return -1;
+    o->count = 0; o->max = max; o->truncated = 0;
+    unsigned char h[8] = { 'R', 'T', 'V', '1', 0, 0, 0, 0 };
+    return fwrite(h, 8, 1, o->f) == 1 ? 0 : -1;
+}
+
+static void vout_close(VOut *o, const char *path) {
+    fseek(o->f, 4, SEEK_SET);
+    fwrite(&o->count, 4, 1, o->f);
+    fclose(o->f);
+    chmod(path, 0666);
+}
+
+static void cmd_vscan(pid_t pid, const char *regionsPath, const char *typeStr, const char *valueStr,
+                      const char *outPath, long maxResults, const char *cancelPath) {
+    VType t; VTarget g;
+    if (parse_vtype(typeStr, &t) != 0) { printf("ERR bad type\n"); return; }
+    if (parse_vtarget(&t, valueStr, &g) != 0) { printf("ERR bad value for %s\n", typeStr); return; }
+    if (maxResults < 1000) maxResults = 1000;
+
+    FILE *rf = fopen(regionsPath, "r");
+    if (!rf) { printf("ERR cannot open regions file\n"); return; }
+    typedef struct { uint64_t s, e; } Rg;
+    Rg *rg = malloc(sizeof(Rg) * ACT_MAX_REGIONS);
+    int n = 0;
+    uint64_t totalBytes = 0;
+    char line[256];
+    while (n < ACT_MAX_REGIONS && fgets(line, sizeof(line), rf)) {
+        unsigned long long a, b;
+        if (sscanf(line, "%llx %llx", &a, &b) != 2 || b <= a) continue;
+        rg[n].s = a; rg[n].e = b; totalBytes += b - a; n++;
+    }
+    fclose(rf);
+    if (n == 0) { free(rg); printf("ERR no regions\n"); return; }
+
+    setpriority(PRIO_PROCESS, 0, 10);
+    char memPath[64];
+    snprintf(memPath, sizeof(memPath), "/proc/%d/mem", pid);
+    int fd = open(memPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { free(rg); printf("ERR open mem failed: %s\n", strerror(errno)); return; }
+    VOut out;
+    if (vout_open(&out, outPath, (uint32_t) maxResults) != 0) { close(fd); free(rg); printf("ERR cannot open output file: %s\n", strerror(errno)); return; }
+    unsigned char *buf = malloc(ACT_CHUNK);
+
+    uint64_t done = 0; int cancelled = 0; unsigned chunks = 0;
+    for (int i = 0; i < n && !cancelled && !out.truncated; i++) {
+        for (uint64_t off = 0; off < rg[i].e - rg[i].s; off += ACT_CHUNK) {
+            if (cancelPath[0] && access(cancelPath, F_OK) == 0) { cancelled = 1; break; }
+            uint64_t base = rg[i].s + off;
+            size_t len = (size_t) ((rg[i].e - base) < ACT_CHUNK ? (rg[i].e - base) : ACT_CHUNK);
+            done += len;
+            if ((++chunks & 31) == 0) { printf("P %llu %llu\n", (unsigned long long) (done >> 20), (unsigned long long) (totalBytes >> 20)); fflush(stdout); }
+            if (pread_full(fd, buf, len, base) != 0) continue; /* unreadable chunk: skip */
+            /* aligned scan: natural alignment of the type (regions are page-aligned) */
+            for (size_t o = 0; o + (size_t) t.size <= len; o += (size_t) t.size) {
+                if (vmatch_exact(&g, buf + o)) {
+                    if (vout_add(&out, base + o, buf + o, t.size) != 0) break;
+                }
+            }
+            if (out.truncated) break;
+            usleep(300);
+        }
+    }
+    free(buf); close(fd); free(rg);
+    uint32_t cnt = out.count; int trunc = out.truncated;
+    vout_close(&out, outPath);
+    if (cancelled) { printf("CANCELLED\n"); return; }
+    printf("DONE %u %d\n", cnt, trunc);
+}
+
+static void cmd_vnext(pid_t pid, const char *inPath, const char *typeStr, const char *filter,
+                      const char *valueStr, const char *outPath, const char *cancelPath) {
+    VType t; VTarget g; memset(&g, 0, sizeof(g));
+    if (parse_vtype(typeStr, &t) != 0) { printf("ERR bad type\n"); return; }
+    int mode; /* 0 exact 1 changed 2 unchanged 3 increased 4 decreased 5 all */
+    if (!strcmp(filter, "exact")) mode = 0;
+    else if (!strcmp(filter, "changed")) mode = 1;
+    else if (!strcmp(filter, "unchanged")) mode = 2;
+    else if (!strcmp(filter, "increased")) mode = 3;
+    else if (!strcmp(filter, "decreased")) mode = 4;
+    else if (!strcmp(filter, "all")) mode = 5;
+    else { printf("ERR bad filter\n"); return; }
+    if (mode == 0 && parse_vtarget(&t, valueStr, &g) != 0) { printf("ERR bad value for %s\n", typeStr); return; }
+    g.t = t;
+
+    FILE *in = fopen(inPath, "rb");
+    if (!in) { printf("ERR cannot open candidate file\n"); return; }
+    unsigned char h[8];
+    uint32_t total = 0;
+    if (fread(h, 8, 1, in) != 1 || memcmp(h, "RTV1", 4) != 0) { fclose(in); printf("ERR bad candidate file\n"); return; }
+    memcpy(&total, h + 4, 4);
+
+    setpriority(PRIO_PROCESS, 0, 10);
+    char memPath[64];
+    snprintf(memPath, sizeof(memPath), "/proc/%d/mem", pid);
+    int fd = open(memPath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fclose(in); printf("ERR open mem failed: %s\n", strerror(errno)); return; }
+    VOut out;
+    if (vout_open(&out, outPath, 0xFFFFFFFFu) != 0) { close(fd); fclose(in); printf("ERR cannot open output file\n"); return; }
+
+    /* Candidates are sorted by address, so a small page cache turns ~1 syscall per hit into ~1 per page. */
+    enum { CACHE = 65536 };
+    unsigned char *cache = malloc(CACHE);
+    uint64_t cacheBase = 0; size_t cacheLen = 0;
+    unsigned char rec[16];
+    int cancelled = 0;
+    for (uint32_t k = 0; k < total; k++) {
+        if ((k & 8191) == 0) {
+            if (cancelPath[0] && access(cancelPath, F_OK) == 0) { cancelled = 1; break; }
+            if ((k & 65535) == 0) { printf("P %u %u\n", k, total); fflush(stdout); }
+            usleep(200);
+        }
+        if (fread(rec, 16, 1, in) != 1) break;
+        uint64_t addr; memcpy(&addr, rec, 8);
+        unsigned char cur[8] = {0};
+        if (!(cacheLen > 0 && addr >= cacheBase && addr + t.size <= cacheBase + cacheLen)) {
+            uint64_t b = addr & ~(uint64_t) 4095;
+            ssize_t r = pread(fd, cache, CACHE, (off_t) b);
+            if (r < (ssize_t) (addr - b + t.size)) {
+                r = pread(fd, cache, 4096, (off_t) b); /* page-sized retry near mapping ends */
+                if (r < (ssize_t) (addr - b + t.size)) { cacheLen = 0; continue; } /* unreadable now: drop */
+            }
+            cacheBase = b; cacheLen = (size_t) r;
+        }
+        memcpy(cur, cache + (addr - cacheBase), t.size);
+
+        int keep = 0;
+        if (mode == 5) keep = 1;
+        else if (mode == 0) keep = vmatch_exact(&g, cur);
+        else {
+            if (mode == 1) keep = memcmp(cur, rec + 8, t.size) != 0;
+            else if (mode == 2) keep = memcmp(cur, rec + 8, t.size) == 0;
+            else {
+                int64_t ia, ib; double da, db;
+                vload(&t, cur, &ia, &da); vload(&t, rec + 8, &ib, &db);
+                if (t.isFloat) { if (isfinite(da) && isfinite(db)) keep = (mode == 3) ? da > db : da < db; }
+                else keep = (mode == 3) ? ia > ib : ia < ib;
+            }
+        }
+        if (keep && vout_add(&out, addr, cur, t.size) != 0) break;
+    }
+    free(cache); close(fd); fclose(in);
+    uint32_t cnt = out.count;
+    vout_close(&out, outPath);
+    if (cancelled) { printf("CANCELLED\n"); return; }
+    printf("DONE %u 0\n", cnt);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { printf("ERR missing command\n"); return 1; }
 
@@ -913,6 +1162,18 @@ int main(int argc, char **argv) {
         pid_t pid = (pid_t) atoi(argv[2]);
         if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
         cmd_activity(pid, argv[3], atoi(argv[4]), atoi(argv[5]), argv[6], atol(argv[7]), argv[8]);
+        return 0;
+    }
+    if (strcmp(argv[1], "vscan") == 0 && argc >= 9) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        cmd_vscan(pid, argv[3], argv[4], argv[5], argv[6], atol(argv[7]), argv[8]);
+        return 0;
+    }
+    if (strcmp(argv[1], "vnext") == 0 && argc >= 9) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        cmd_vnext(pid, argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
         return 0;
     }
     if (strcmp(argv[1], "cpatch") == 0 && argc >= 6) {

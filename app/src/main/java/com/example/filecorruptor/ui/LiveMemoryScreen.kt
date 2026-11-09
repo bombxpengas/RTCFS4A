@@ -22,7 +22,6 @@ import androidx.compose.material.icons.filled.Eco
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PictureInPictureAlt
-import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Visibility
@@ -49,12 +48,7 @@ import com.example.filecorruptor.livemem.MemoryGovernor
 import com.example.filecorruptor.livemem.MemoryRegion
 import com.example.filecorruptor.log.RtcLog
 import com.example.filecorruptor.overlay.OverlayService
-import com.example.filecorruptor.livemem.NesAnchorHit
-import com.example.filecorruptor.livemem.NesAnchorKind
 import com.example.filecorruptor.livemem.RootMemoryHelper
-import com.example.filecorruptor.livemem.findOamAnchors
-import com.example.filecorruptor.livemem.findPaletteRamAnchors
-import com.example.filecorruptor.livemem.proposeRamStartsFromOamShadow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -339,44 +333,6 @@ private suspend fun analyzeAllRegionsActivity(
     return runActivityScan(context, pid, regions, samples, intervalMs, onProgress)
 }
 
-private const val NES_SCAN_CHUNK = 2 * 1024 * 1024
-private const val NES_SCAN_OVERLAP = 512
-private const val NES_SCAN_MAX_PER_REGION = 256L * 1024 * 1024
-
-/**
- * Looks for NES palette/OAM-shaped bytes in [region] a chunk at a time (with an overlap so a pattern
- * straddling a boundary is still seen once), instead of reading up to 16 MB in one go and silently
- * ignoring the rest of a bigger region. Memory use is one chunk, whatever the region size.
- */
-private fun scanRegionForNesAnchors(
-    context: android.content.Context,
-    pid: Int,
-    region: MemoryRegion
-): List<NesAnchorHit> {
-    val total = minOf(region.size, NES_SCAN_MAX_PER_REGION)
-    val out = ArrayList<NesAnchorHit>()
-    val lastEnd = HashMap<String, Long>()
-    var off = 0L
-    while (off < total) {
-        val len = minOf(NES_SCAN_CHUNK.toLong() + NES_SCAN_OVERLAP, region.size - off).toInt()
-        val bytes = RootMemoryHelper.readMemory(context, pid, region.start + off, len)
-        if (bytes != null) {
-            val lastChunk = off + NES_SCAN_CHUNK >= total
-            val hits = (findPaletteRamAnchors(bytes) + findOamAnchors(bytes)).sortedBy { it.offset }
-            for (h in hits) {
-                if (!lastChunk && h.offset >= NES_SCAN_CHUNK) continue // belongs to the next chunk
-                val abs = off + h.offset
-                if (abs < (lastEnd[h.kind.name] ?: -1L)) continue // already reported by the previous chunk
-                lastEnd[h.kind.name] = abs + h.size
-                out += h.copy(offset = abs.toInt())
-            }
-        }
-        off += NES_SCAN_CHUNK
-        try { Thread.sleep(2) } catch (_: InterruptedException) { break } // breathing room for other apps
-    }
-    return out
-}
-
 // Shared with the floating overlay (see LiveSession): the targets live in the session, not in this screen.
 private typealias CorruptionTarget = LiveTarget
 
@@ -468,13 +424,6 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
     var analysisProgress by remember { mutableStateOf(0 to 0) }
     var analysisSamples by remember { mutableStateOf(8f) }
     var targetSizeText by remember { mutableStateOf("") }
-
-    // NES palette/OAM signature scan — content-based anchors (see
-    // NesRamSignatures.kt) that don't need any activity sampling to be
-    // useful, since they're derived from what real NES palette/OAM RAM
-    // always looks like rather than from watching for change over time.
-    var nesAnchorResults by remember { mutableStateOf<Map<MemoryRegion, List<NesAnchorHit>>>(emptyMap()) }
-    var nesAnchorScanRunning by remember { mutableStateOf(false) }
 
     var previewLabel by remember { mutableStateOf<String?>(null) }
     var previewText by remember { mutableStateOf<String?>(null) }
@@ -756,7 +705,6 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                     previousRegions = emptySet()
                                     scanCount = 0
                                     regionActivity = emptyMap()
-                                    nesAnchorResults = emptyMap()
                                     expandedActivityRegion = null
                                     // targets deliberately NOT cleared here —
                                     // switching process is how you add a
@@ -799,28 +747,17 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 var regionPathFilter by remember { mutableStateOf("") }
                 val isNewRegion: (MemoryRegion) -> Boolean = { scanCount > 1 && it !in previousRegions }
 
-                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount, regionPathFilter, regionActivity, nesAnchorResults) {
+                val visibleRegions = remember(regions, showAllRegions, previousRegions, scanCount, regionPathFilter, regionActivity) {
                     val filtered = if (showAllRegions) regions.filter { it.isWritable && it.size >= 4096 }
                         else regions.filter { it.isSafeToCorrupt && it.size >= 4096 && !looksLikeNoise(it) }
                     val pathMatched = if (regionPathFilter.isBlank()) filtered
                         else filtered.filter { it.path.contains(regionPathFilter, ignoreCase = true) }
-                    // A NES palette/OAM content match outranks everything else —
-                    // it's a static signature almost nothing produces by
-                    // accident (see NesRamSignatures.kt), stronger than a mere
-                    // activity score because activity alone can't tell "NES RAM"
-                    // apart from any other same-sized buffer that happens to be
-                    // changing. Measured activity is still the next-strongest
-                    // signal — an actual measurement, not a guess — with
-                    // new-since-scan and size as tie-breakers among regions
-                    // neither scan has said anything about yet. Label-based
-                    // "this kind of region tends to be good" heuristics were
-                    // tried and deliberately removed — which region matters
-                    // turned out to vary too much per emulator/core to be a
-                    // reliable signal, and a false "recommended" label is worse
-                    // than no label.
+                    // Measured activity is the strongest signal here — an actual measurement, not a guess —
+                    // with new-since-scan and size as tie-breakers among regions no scan has said anything
+                    // about yet. Label-based "this kind of region tends to be good" heuristics were tried and
+                    // deliberately removed: which region matters varies too much per emulator/core.
                     pathMatched.sortedWith(
-                        compareByDescending<MemoryRegion> { nesAnchorResults[it]?.maxOfOrNull { h -> h.confidence } ?: -1.0 }
-                            .thenByDescending { regionActivity[it]?.totalScore ?: -1 }
+                        compareByDescending<MemoryRegion> { regionActivity[it]?.totalScore ?: -1 }
                             .thenByDescending { isNewRegion(it) }
                             .thenByDescending { it.size }
                     )
@@ -878,62 +815,33 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
-                    Button(
-                        onClick = {
-                            val toScan = visibleRegions
-                            nesAnchorScanRunning = true
-                            LiveSession.setProgress("NES signature scan", 0, 0)
-                            scope.launch {
-                                val results = withContext(Dispatchers.IO) {
-                                    val out = mutableMapOf<MemoryRegion, List<NesAnchorHit>>()
-                                    for (region in toScan) {
-                                        val hits = scanRegionForNesAnchors(context, proc.pid, region)
-                                        if (hits.isNotEmpty()) out[region] = hits
-                                    }
-                                    out
+                    key(proc.pid) {
+                        ValueSearchPanel(
+                            pid = proc.pid,
+                            regions = visibleRegions,
+                            onTargetAddress = { region, offset, size ->
+                                val target = CorruptionTarget(proc, region)
+                                if (targets.none { it.process.pid == proc.pid && it.region == region }) {
+                                    targets = targets + target
                                 }
-                                nesAnchorScanRunning = false
-                                LiveSession.clearProgress()
-                                nesAnchorResults = results
-                                if (results.isEmpty()) {
+                                val eng = engine
+                                val values = eng?.let { engineViewModel.valuesFor(it.id) }
+                                if (values != null && values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
+                                    values["rangeStart"] = ParamValue.of(offset.toString())
+                                    values["rangeEnd"] = ParamValue.of((offset + size).toString())
                                     isErrorStatus = false
-                                    statusMessage = "No palette/OAM-shaped bytes found in any visible region right " +
-                                        "now — a title screen or a paused/idle moment can leave the palette " +
-                                        "flatter than usual, so try again during active gameplay, or widen the " +
-                                        "list with \"Show everything\" first."
+                                    statusMessage = "Targeting only the $size byte(s) at +0x${offset.toString(16)} of that region."
                                 } else {
                                     isErrorStatus = false
-                                    statusMessage = "Found NES palette/OAM-shaped bytes in ${results.size} of " +
-                                        "${toScan.size} region(s) — sorted to the top of the list below."
-                                    expandedActivityRegion = results.entries
-                                        .maxByOrNull { (_, hits) -> hits.maxOf { it.confidence } }
-                                        ?.key
+                                    statusMessage = "Region added as a target, but this engine has no range option, so the whole " +
+                                        "region would be corrupted — pick an engine with rangeStart/rangeEnd to hit just that value."
                                 }
+                            },
+                            onStatus = { message, isError ->
+                                isErrorStatus = isError
+                                statusMessage = message
                             }
-                        },
-                        enabled = !nesAnchorScanRunning,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Filled.Radar, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Scan for NES RAM Signatures (palette/OAM)")
-                    }
-                    Text(
-                        "Looks for the byte-level shape of real NES sprite/OAM RAM (a long run of " +
-                            "one repeated, off-screen-parked sprite entry, excluding solid fills like " +
-                            "0xFF — that's an allocator poison pattern, not a game) and, as a much " +
-                            "weaker secondary signal, palette RAM (32 bytes all <= 0x3F). Sprite/OAM " +
-                            "hits are the strong lead here; palette hits are common in ordinary memory " +
-                            "too (real memory is full of small numbers — counters, flags, indices — " +
-                            "so \"32 bytes <= 0x3F\" isn't the rare event it sounds like) and should be " +
-                            "read as \"possible\", not \"likely\", on their own. Either way, confirm with " +
-                            "an activity scan before trusting it. Works on a paused frame — doesn't need " +
-                            "gameplay happening.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (nesAnchorScanRunning) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        )
                     }
                 }
 
@@ -1001,16 +909,13 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                             items(visibleRegions) { region ->
                                 val isTargeted = targets.any { it.process.pid == proc.pid && it.region == region }
                                 val isNew = isNewRegion(region)
-                                val nesHits = nesAnchorResults[region]
                                 ListItem(
                                     headlineContent = {
                                         val score = regionActivity[region]?.totalScore
-                                        val bestNesConf = nesHits?.maxOfOrNull { it.confidence }
                                         Text(
                                             buildString {
                                                 append(formatSize(region.size))
                                                 if (score != null) append("   •   activity: $score")
-                                                if (bestNesConf != null) append("   •   NES-shaped: %.0f%%".format(bestNesConf * 100))
                                             }
                                         )
                                     },
@@ -1022,13 +927,6 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                                     },
                                     leadingContent = {
                                         Row {
-                                            if (nesHits != null) {
-                                                Icon(
-                                                    Icons.Filled.Radar,
-                                                    contentDescription = "Matches NES palette/OAM RAM shape",
-                                                    tint = MaterialTheme.colorScheme.primary
-                                                )
-                                            }
                                             if (isNew) {
                                                 Icon(
                                                     Icons.Filled.Eco,
@@ -1176,114 +1074,6 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                 }
 
                 val expandedRegion = expandedActivityRegion
-                if (expandedRegion != null) {
-                    val nesHits = nesAnchorResults[expandedRegion]
-                    if (!nesHits.isNullOrEmpty()) {
-                        Text(
-                            "NES Signature Matches in ${formatSize(expandedRegion.size)} region",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            "Static content matches, not activity — safe to use even on a paused/title-" +
-                                "screen frame. \"RAM start guess\" only appears for a sprite/OAM match, and " +
-                                "assumes this game keeps its sprite table at the usual CPU RAM page ($0200); " +
-                                "confirm with a preview or an activity scan before relying on it.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Card {
-                            Column(Modifier.padding(8.dp)) {
-                                nesHits.sortedByDescending { it.confidence }.forEach { hit ->
-                                    val kindLabel = when (hit.kind) {
-                                        NesAnchorKind.PALETTE_RAM -> "Palette RAM shape (weak signal)"
-                                        NesAnchorKind.SPRITE_OAM -> "Sprite/OAM shape (strong signal)"
-                                    }
-                                    ListItem(
-                                        headlineContent = {
-                                            Text("$kindLabel — 0x${hit.offset.toString(16)}  (${hit.size} bytes)")
-                                        },
-                                        supportingContent = {
-                                            Text("Confidence: %.0f%%".format(hit.confidence * 100))
-                                        },
-                                        trailingContent = {
-                                            IconButton(onClick = {
-                                                previewLabel = "$kindLabel at 0x${hit.offset.toString(16)} in ${formatSize(expandedRegion.size)} region"
-                                                previewText = null
-                                                previewLoading = true
-                                                scope.launch {
-                                                    val bytes = withContext(Dispatchers.IO) {
-                                                        RootMemoryHelper.readMemory(
-                                                            context, proc.pid,
-                                                            expandedRegion.start + hit.offset,
-                                                            hit.size
-                                                        )
-                                                    }
-                                                    previewLoading = false
-                                                    previewText = if (bytes != null) hexDump(bytes, baseOffset = hit.offset)
-                                                    else "Could not read this span — it may have moved or the process may be gone."
-                                                }
-                                            }) {
-                                                Icon(Icons.Filled.Visibility, contentDescription = "Preview bytes as hex/ASCII")
-                                            }
-                                        }
-                                    )
-                                    if (hit.kind == NesAnchorKind.SPRITE_OAM) {
-                                        val ramGuesses = proposeRamStartsFromOamShadow(listOf(hit), expandedRegion.size.toInt())
-                                        ramGuesses.take(4).forEach { (ramStart, confidence) ->
-                                            ListItem(
-                                                headlineContent = {
-                                                    Text("  RAM start guess — 0x${ramStart.toString(16)}  (2048 bytes)")
-                                                },
-                                                supportingContent = {
-                                                    Text("Confidence: %.0f%%  (offset - 0x${(hit.offset - ramStart).toString(16)})".format(confidence * 100))
-                                                },
-                                                trailingContent = {
-                                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                                        IconButton(onClick = {
-                                                            previewLabel = "Guessed RAM (0x${ramStart.toString(16)}) in ${formatSize(expandedRegion.size)} region"
-                                                            previewText = null
-                                                            previewLoading = true
-                                                            scope.launch {
-                                                                val bytes = withContext(Dispatchers.IO) {
-                                                                    RootMemoryHelper.readMemory(
-                                                                        context, proc.pid,
-                                                                        expandedRegion.start + ramStart,
-                                                                        0x800
-                                                                    )
-                                                                }
-                                                                previewLoading = false
-                                                                previewText = if (bytes != null) hexDump(bytes, baseOffset = ramStart)
-                                                                else "Could not read this span — it may have moved or the process may be gone."
-                                                            }
-                                                        }) {
-                                                            Icon(Icons.Filled.Visibility, contentDescription = "Preview bytes as hex/ASCII")
-                                                        }
-                                                        TextButton(onClick = {
-                                                            targetSizeText = "2048"
-                                                            val target = CorruptionTarget(proc, expandedRegion)
-                                                            if (targets.none { it.process.pid == proc.pid && it.region == expandedRegion }) {
-                                                                targets = targets + target
-                                                            }
-                                                            val eng = engine
-                                                            if (eng != null) {
-                                                                val values = engineViewModel.valuesFor(eng.id)
-                                                                if (values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
-                                                                    values["rangeStart"] = ParamValue.of(ramStart.toString())
-                                                                    values["rangeEnd"] = ParamValue.of((ramStart + 0x800).toString())
-                                                                }
-                                                            }
-                                                        }) { Text("Use range") }
-                                                    }
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 if (!analysisRunning && expandedRegion != null) {
                     val activity = regionActivity[expandedRegion]
                     val targetSize = targetSizeText.toIntOrNull()?.takeIf { it > 0 }
