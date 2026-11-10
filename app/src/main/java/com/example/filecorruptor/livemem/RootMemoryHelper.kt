@@ -517,7 +517,8 @@ object RootMemoryHelper {
         args: List<String>,
         cancelFile: File,
         onProgress: (Long, Long) -> Unit,
-        isCancelled: () -> Boolean
+        isCancelled: () -> Boolean,
+        onOtherLine: ((String) -> Unit)? = null
     ): HelperRun {
         val process = ProcessBuilder("su", "-c", buildCommand(context, args)).redirectErrorStream(true).start()
         val last = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
@@ -553,6 +554,7 @@ object RootMemoryHelper {
                         }
                         line == "CANCELLED" -> cancelled = true
                         line.startsWith("ERR") -> error = line
+                        else -> onOtherLine?.invoke(line)
                     }
                 }
             }

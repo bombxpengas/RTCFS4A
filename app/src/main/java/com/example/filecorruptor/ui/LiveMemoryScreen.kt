@@ -816,6 +816,32 @@ fun LiveMemoryScreen(engineViewModel: EngineViewModel = viewModel()) {
                     )
 
                     key(proc.pid) {
+                        EmulatorRamPanel(
+                            pid = proc.pid,
+                            regions = regions,
+                            onTargetRam = { region, offset, size ->
+                                if (targets.none { it.process.pid == proc.pid && it.region == region }) {
+                                    targets = targets + CorruptionTarget(proc, region)
+                                }
+                                val eng = engine
+                                val values = eng?.let { engineViewModel.valuesFor(it.id) }
+                                isErrorStatus = false
+                                if (values != null && values.containsKey("rangeStart") && values.containsKey("rangeEnd")) {
+                                    values["rangeStart"] = ParamValue.of(offset.toString())
+                                    values["rangeEnd"] = ParamValue.of((offset + size).toString())
+                                    statusMessage = "Targeting the emulated RAM only (${size shr 20} MB at +0x${offset.toString(16)} of that region)."
+                                } else {
+                                    statusMessage = "Region added as a target, but this engine has no range option, so the whole region would be corrupted — pick an engine with rangeStart/rangeEnd to hit just the RAM."
+                                }
+                            },
+                            onStatus = { message, isError ->
+                                isErrorStatus = isError
+                                statusMessage = message
+                            }
+                        )
+                    }
+
+                    key(proc.pid) {
                         ValueSearchPanel(
                             pid = proc.pid,
                             regions = visibleRegions,

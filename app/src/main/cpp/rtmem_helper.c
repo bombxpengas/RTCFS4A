@@ -91,6 +91,14 @@
  *          count, then u64 address + u64 raw value per hit). Progress lines
  *          "P <done> <total>", finishing with "DONE <count> <truncated>".
  *
+ *   rtmem_helper findn64 <pid> <regions_file> <rom_path|-> <cancel_file>
+ *       -> native port of the emulator-RAM finder validated in tools/emu-lab (see README there): scans the
+ *          listed regions (resident pages only, highest priority first) for N64 anchors in all three byte
+ *          orders, lets them vote for the RDRAM base, and prints
+ *            "P done total", "DET <ram|rom> <be|le32|v64> <hex base> <bits> <ambiguous> <live_permille> <groups>",
+ *            "STAT <regions> <MB read> <ms>", "DONE".
+ *          With a ROM file it also fingerprints the ROM (RAM copy at the entry point + the cartridge image).
+ *
  *   rtmem_helper alive <pid> <name>
  *       -> ALIVE | STOPPED | DEAD [reason]. <name> must match the pid's
  *          argv[0], so a recycled pid is reported as DEAD, not ALIVE.
@@ -1109,6 +1117,345 @@ static void cmd_vnext(pid_t pid, const char *inPath, const char *typeStr, const 
     printf("DONE %u 0\n", cnt);
 }
 
+/* ------------------------------------------------------------------ */
+/* findn64: emulator RAM finder (port of tools/emu-lab emulab/)         */
+/* ------------------------------------------------------------------ */
+
+enum { G_VEC = 0, G_GLOB = 1, G_ROMCOPY = 2, G_ROM = 3 };
+static const char *G_NAME[] = { "vectors", "globals", "romcopy", "rom" };
+static const char *TF_NAME[] = { "be", "le32", "v64" };
+
+static void tf_apply(int tf, const unsigned char *in, unsigned char *out, size_t len) {
+    for (size_t i = 0; i + 4 <= len; i += 4) {
+        if (tf == 0) { out[i] = in[i]; out[i+1] = in[i+1]; out[i+2] = in[i+2]; out[i+3] = in[i+3]; }
+        else if (tf == 1) { out[i] = in[i+3]; out[i+1] = in[i+2]; out[i+2] = in[i+1]; out[i+3] = in[i]; }
+        else { out[i] = in[i+1]; out[i+1] = in[i]; out[i+2] = in[i+3]; out[i+3] = in[i+2]; }
+    }
+}
+
+static void tword(uint32_t v, int tf, unsigned char out[4]) {
+    unsigned char b[4] = { (unsigned char) (v >> 24), (unsigned char) (v >> 16), (unsigned char) (v >> 8), (unsigned char) v };
+    tf_apply(tf, b, out, 4);
+}
+
+typedef struct { unsigned char core[32]; int len, group, tf, romOff; } FNeedle;
+typedef struct { int kind, group, tf, vec; uint64_t base, src, copyLoc; } FHit;
+
+static uint32_t crc_tab[256];
+static void crc_init(void) {
+    for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; crc_tab[i] = c; }
+}
+static uint32_t crc32_buf(const unsigned char *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static int rd_word(int fd, uint64_t addr, int tf, uint32_t *out) {
+    unsigned char b[4], t[4];
+    if (pread(fd, b, 4, (off_t) addr) != 4) return -1;
+    tf_apply(tf, b, t, 4);
+    *out = ((uint32_t) t[0] << 24) | ((uint32_t) t[1] << 16) | ((uint32_t) t[2] << 8) | t[3];
+    return 0;
+}
+
+/* Reads len bytes; unreadable pages come back as zeros (never fails for holes). */
+static void read_robust(int fd, unsigned char *buf, size_t len, uint64_t addr) {
+    if (pread_full(fd, buf, len, addr) == 0) return;
+    memset(buf, 0, len);
+    for (size_t pos = 0; pos < len;) {
+        uint64_t a = addr + pos;
+        size_t step = 4096 - (a % 4096); if (step > len - pos) step = len - pos;
+        ssize_t r = pread(fd, buf + pos, step, (off_t) a);
+        if (r < 0) memset(buf + pos, 0, step);
+        pos += step;
+    }
+}
+
+/* Resident page runs of [start,end) via /proc/pid/pagemap (falls back to the whole range). */
+static int present_runs(int pmfd, uint64_t start, uint64_t end, uint64_t (*runs)[2], int maxRuns) {
+    if (pmfd < 0) { runs[0][0] = start; runs[0][1] = end; return 1; }
+    int n = 0; uint64_t cur = 0; int inRun = 0;
+    uint64_t firstPage = start / 4096, lastPage = (end + 4095) / 4096;
+    static uint64_t ent[16384];
+    for (uint64_t pg = firstPage; pg < lastPage;) {
+        size_t cnt = (size_t) (lastPage - pg); if (cnt > 16384) cnt = 16384;
+        ssize_t r = pread(pmfd, ent, cnt * 8, (off_t) (pg * 8));
+        if (r != (ssize_t) (cnt * 8)) { runs[0][0] = start; runs[0][1] = end; return 1; }
+        for (size_t i = 0; i < cnt; i++) {
+            int present = (int) ((ent[i] >> 63) & 1) | (int) ((ent[i] >> 62) & 1);
+            if (present && !inRun) { cur = pg + i; inRun = 1; }
+            else if (!present && inRun) { if (n < maxRuns) { runs[n][0] = cur * 4096; runs[n][1] = (pg + i) * 4096; n++; } inRun = 0; }
+        }
+        pg += cnt;
+    }
+    if (inRun && n < maxRuns) { runs[n][0] = cur * 4096; runs[n][1] = lastPage * 4096; n++; }
+    for (int i = 0; i < n; i++) { if (runs[i][0] < start) runs[i][0] = start; if (runs[i][1] > end) runs[i][1] = end; }
+    return n;
+}
+
+static uint64_t page_hash(const unsigned char *p) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < 4096; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ULL; }
+    return h;
+}
+
+typedef struct { int kind, tf; uint64_t base; int nHits; int *hit; int dropped; double bits; int amb; int live; int groupMask; int vecMask; } FCand;
+
+static void cmd_findn64(pid_t pid, const char *regionsPath, const char *romPath, const char *cancelPath) {
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    crc_init();
+
+    /* ---- needles ---- */
+    FNeedle *nd = calloc(64, sizeof(FNeedle)); int nn = 0;
+    for (int tf = 0; tf < 3; tf++) {
+        nd[nn].len = 8; tword(0x03400008u, tf, nd[nn].core); tword(0, tf, nd[nn].core + 4); nd[nn].group = G_VEC; nd[nn].tf = tf; nn++;
+        nd[nn].len = 4; tword(0xB0000000u, tf, nd[nn].core); nd[nn].group = G_GLOB; nd[nn].tf = tf; nn++;
+    }
+    unsigned char *z = NULL; size_t zlen = 0; uint32_t entries[2]; int nEntries = 0;
+    if (romPath && strcmp(romPath, "-") != 0) {
+        size_t sz = 0; const char *err = NULL;
+        unsigned char *raw = slurp(romPath, &sz, &err);
+        if (raw && sz >= 0x2000) {
+            z = raw; zlen = sz;
+            if (!memcmp(raw, "\x80\x37\x12\x40", 4)) { /* z64 */ }
+            else if (!memcmp(raw, "\x37\x80\x40\x12", 4)) { for (size_t i = 0; i + 2 <= sz; i += 2) { unsigned char t = z[i]; z[i] = z[i+1]; z[i+1] = t; } }
+            else if (!memcmp(raw, "\x40\x12\x37\x80", 4)) { for (size_t i = 0; i + 4 <= sz; i += 4) { unsigned char a = z[i], b = z[i+1]; z[i] = z[i+3]; z[i+1] = z[i+2]; z[i+2] = b; z[i+3] = a; } }
+            else { free(raw); z = NULL; }
+        } else free(raw);
+    }
+    if (z) {
+        uint32_t pc = ((uint32_t) z[8] << 24) | ((uint32_t) z[9] << 16) | ((uint32_t) z[10] << 8) | z[11];
+        uint32_t crc = crc32_buf(z + 0x40, 0x1000 - 0x40);
+        int shift = 0, known = 1;
+        switch (crc) { case 0x6170A4A1u: case 0x90BB6CB5u: case 0x98BC2C86u: case 0x009E9EA3u: shift = 0; break;
+                       case 0x0B050EE0u: shift = -0x100000; break; case 0xACC8580Au: shift = -0x200000; break; default: known = 0; }
+        if (known) entries[nEntries++] = (uint32_t) (pc + shift) & 0x1FFFFFFF;
+        else { entries[nEntries++] = pc & 0x1FFFFFFF; entries[nEntries++] = (pc - 0x100000) & 0x1FFFFFFF; }
+        size_t copyEnd = zlen < 0x101000 ? zlen : 0x101000;
+        uint32_t rng = 0x64;
+        for (int grp = 0; grp < 2; grp++) {
+            size_t lo = grp == 0 ? 0x1000 : copyEnd, hi = grp == 0 ? copyEnd : zlen;
+            if (grp == 1 && hi - lo < 64) { lo = 0x1000; hi = zlen; }
+            int got = 0;
+            for (int tries = 0; tries < 4000 && got < 4 && hi - lo > 64; tries++) {
+                rng = rng * 1664525u + 1013904223u;
+                size_t o = (lo + (rng % (uint32_t) (hi - 32 - lo))) & ~(size_t) 3;
+                unsigned char seen[256] = {0}; int distinct = 0;
+                for (int k = 0; k < 32; k++) if (!seen[z[o + k]]++) distinct++;
+                if (distinct < 16) continue;
+                int count = 0; const unsigned char *q = z;
+                while (count < 2 && (q = memmem(q, zlen - (size_t) (q - z), z + o, 32)) != NULL) { count++; q++; }
+                if (count != 1) continue;
+                for (int tf = 0; tf < 3; tf++) {
+                    nd[nn].len = 32; tf_apply(tf, z + o, nd[nn].core, 32); nd[nn].group = grp == 0 ? G_ROMCOPY : G_ROM; nd[nn].tf = tf; nd[nn].romOff = (int) o; nn++;
+                }
+                got++;
+            }
+        }
+    }
+
+    /* ---- regions ---- */
+    FILE *rf = fopen(regionsPath, "r");
+    if (!rf) { printf("ERR cannot open regions file\n"); return; }
+    typedef struct { uint64_t s, e; } Rg;
+    Rg *rg = malloc(sizeof(Rg) * ACT_MAX_REGIONS); int nr = 0; char line[256];
+    while (nr < ACT_MAX_REGIONS && fgets(line, sizeof(line), rf)) {
+        unsigned long long a, b; if (sscanf(line, "%llx %llx", &a, &b) == 2 && b > a) { rg[nr].s = a; rg[nr].e = b; nr++; }
+    }
+    fclose(rf);
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { printf("ERR open mem failed: %s\n", strerror(errno)); return; }
+    snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
+    int pmfd = open(path, O_RDONLY | O_CLOEXEC);
+    setpriority(PRIO_PROCESS, 0, 5);
+
+    /* ---- scan ---- */
+    enum { MAXH = 8192, CH = 4 << 20, OVL = 64 };
+    FHit *hits = malloc(sizeof(FHit) * MAXH); int nh = 0;
+    unsigned char *buf = malloc(CH + OVL);
+    static uint64_t runs[8192][2];
+    uint64_t bytesRead = 0; int cancelled = 0, skippedRegions = 0;
+    int slotHead[64], nextK[64]; uint32_t firstW[64];
+    for (int i = 0; i < 64; i++) slotHead[i] = -1;
+    for (int k = 0; k < nn; k++) { memcpy(&firstW[k], nd[k].core, 4); int sl = (int) ((firstW[k] * 0x9E3779B1u) >> 26); nextK[k] = slotHead[sl]; slotHead[sl] = k; }
+    for (int r = 0; r < nr && !cancelled; r++) {
+        int nruns = present_runs(pmfd, rg[r].s, rg[r].e, runs, 8192);
+        for (int u = 0; u < nruns && !cancelled; u++) {
+            for (uint64_t pos = runs[u][0]; pos < runs[u][1]; pos += CH) {
+                if (cancelPath[0] && access(cancelPath, F_OK) == 0) { cancelled = 1; break; }
+                size_t len = (size_t) (runs[u][1] - pos); if (len > CH + OVL) len = CH + OVL;
+                read_robust(fd, buf, len, pos); bytesRead += len;
+                /* Every anchor is word-aligned (a base is 4-aligned and anchors sit at multiples of 4), so scan
+                 * 4-byte words against a tiny hash of the needles' first words; zero words — most of RAM — are free. */
+                for (size_t wi = 0; wi + 4 <= len; wi += 4) {
+                    uint32_t w; memcpy(&w, buf + wi, 4);
+                    if (!w) continue;
+                    for (int k = slotHead[(w * 0x9E3779B1u) >> 26]; k >= 0; k = nextK[k]) {
+                        if (firstW[k] != w || wi + (size_t) nd[k].len > len) continue;
+                        if (memcmp(buf + wi, nd[k].core, (size_t) nd[k].len)) continue;
+                        if (wi >= (size_t) CH && pos + CH < runs[u][1]) continue; /* the next chunk owns it */
+                        uint64_t addr = pos + (uint64_t) wi;
+                        int tf = nd[k].tf;
+                        if (nd[k].group == G_VEC) {
+                            for (int v = 0; v < 4; v++) {
+                                uint64_t base = addr - (uint64_t) (v * 0x80 + 8); uint32_t w0, w1;
+                                if (rd_word(fd, base + (uint64_t) v * 0x80, tf, &w0) || rd_word(fd, base + (uint64_t) v * 0x80 + 4, tf, &w1)) continue;
+                                if ((w0 >> 16) == 0x3C1A && (w1 >> 16) == 0x275A && nh < MAXH)
+                                    hits[nh++] = (FHit) { 0, G_VEC, tf, v, base, addr, 0 };
+                            }
+                        } else if (nd[k].group == G_GLOB) {
+                            uint64_t base = addr - 0x308; uint32_t mem, tv, rt;
+                            if (!rd_word(fd, base + 0x318, tf, &mem) && !rd_word(fd, base + 0x300, tf, &tv) && !rd_word(fd, base + 0x304, tf, &rt)
+                                && (mem == 0x400000 || mem == 0x800000) && tv <= 2 && rt <= 1 && nh < MAXH)
+                                hits[nh++] = (FHit) { 0, G_GLOB, tf, 0, base, addr, 0 };
+                        } else if (nd[k].group == G_ROM) {
+                            uint64_t base = addr - (uint64_t) nd[k].romOff; unsigned char h[16], e[16];
+                            if (pread(fd, h, 16, (off_t) base) == 16) { tf_apply(tf, z, e, 16); if (!memcmp(h, e, 16) && nh < MAXH) hits[nh++] = (FHit) { 1, G_ROM, tf, 0, base, addr, 0 }; }
+                        } else if (nd[k].group == G_ROMCOPY) {
+                            for (int en = 0; en < nEntries; en++) {
+                                uint64_t base = addr - ((uint64_t) entries[en] + (uint64_t) (nd[k].romOff - 0x1000)); uint64_t loc = base + entries[en];
+                                unsigned char h[64], e[64];
+                                if (pread(fd, h, 64, (off_t) loc) == 64) { tf_apply(tf, z + 0x1000, e, 64); if (!memcmp(h, e, 64) && nh < MAXH) hits[nh++] = (FHit) { 0, G_ROMCOPY, tf, 0, base, addr, loc }; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        printf("P %d %d\n", r + 1, nr); fflush(stdout);
+        /* early exit: globals + vectors (or the ROM copy plus either) agreeing on one base is conclusive */
+        int conclusive = 0;
+        for (int a = 0; a < nh && !conclusive; a++) {
+            if (hits[a].kind != 0) continue;
+            int hasV = 0, hasG = 0, hasC = 0;
+            for (int b = 0; b < nh; b++) if (hits[b].kind == 0 && hits[b].base == hits[a].base && hits[b].tf == hits[a].tf) {
+                hasV |= hits[b].group == G_VEC; hasG |= hits[b].group == G_GLOB; hasC |= hits[b].group == G_ROMCOPY;
+            }
+            if ((hasV && hasG) || (hasC && (hasV || hasG))) conclusive = 1;
+        }
+        if (conclusive && r + 1 < nr) { skippedRegions = nr - r - 1; break; }
+    }
+    close(fd); free(buf);
+    if (cancelled) { printf("CANCELLED\n"); return; }
+
+    /* ---- vote ---- */
+    FCand *cd = calloc(MAXH, sizeof(FCand)); int nc = 0;
+    for (int i = 0; i < nh; i++) {
+        if (hits[i].base % 4) continue;
+        int c = -1;
+        for (int j = 0; j < nc; j++) if (cd[j].kind == hits[i].kind && cd[j].tf == hits[i].tf && cd[j].base == hits[i].base) { c = j; break; }
+        if (c < 0) { c = nc++; cd[c].kind = hits[i].kind; cd[c].tf = hits[i].tf; cd[c].base = hits[i].base; cd[c].hit = malloc(sizeof(int) * 64); }
+        if (cd[c].nHits < 64) cd[c].hit[cd[c].nHits++] = i;
+    }
+    /* explain away: ROM-copy hits that are really the cartridge image */
+    for (int c = 0; c < nc; c++) {
+        if (cd[c].kind != 0) continue;
+        int kept = 0;
+        for (int h = 0; h < cd[c].nHits; h++) {
+            FHit *x = &hits[cd[c].hit[h]]; int explained = 0;
+            if (x->group == G_ROMCOPY)
+                for (int j = 0; j < nc; j++) if (cd[j].kind == 1 && cd[j].tf == cd[c].tf && x->copyLoc == cd[j].base + 0x1000) explained = 1;
+            if (!explained) cd[c].hit[kept++] = cd[c].hit[h];
+        }
+        cd[c].nHits = kept;
+        if (!kept) cd[c].dropped = 1;
+    }
+    /* dominance: strict subset of another base's evidence = alias */
+    for (int a = 0; a < nc; a++) {
+        if (cd[a].dropped) continue;
+        for (int b = 0; b < nc && !cd[a].dropped; b++) {
+            if (a == b || cd[b].dropped || cd[a].kind != cd[b].kind || cd[a].tf != cd[b].tf) continue;
+            int subset = 1;
+            for (int i = 0; i < cd[a].nHits && subset; i++) {
+                int found = 0;
+                for (int j = 0; j < cd[b].nHits; j++) if (hits[cd[a].hit[i]].group == hits[cd[b].hit[j]].group && hits[cd[a].hit[i]].src == hits[cd[b].hit[j]].src) { found = 1; break; }
+                if (!found) subset = 0;
+            }
+            if (subset) {
+                int sameSize = 1;  /* equal sets are ambiguity, not aliasing */
+                for (int j = 0; j < cd[b].nHits && sameSize; j++) {
+                    int found = 0;
+                    for (int i = 0; i < cd[a].nHits; i++) if (hits[cd[a].hit[i]].group == hits[cd[b].hit[j]].group && hits[cd[a].hit[i]].src == hits[cd[b].hit[j]].src) { found = 1; break; }
+                    if (!found) sameSize = 0;
+                }
+                if (!sameSize) cd[a].dropped = 1;
+            }
+        }
+    }
+    /* score */
+    for (int c = 0; c < nc; c++) {
+        if (cd[c].dropped) continue;
+        double bits = 0; int gm = 0, vm = 0;
+        for (int h = 0; h < cd[c].nHits; h++) { FHit *x = &hits[cd[c].hit[h]]; gm |= 1 << x->group; if (x->group == G_VEC) vm |= 1 << x->vec; }
+        for (int g = 0; g < 4; g++) if (gm & (1 << g)) {
+            if (g == G_VEC) { int nv = __builtin_popcount(vm); bits += nv == 1 ? 16 : nv == 2 ? 36 : nv == 3 ? 56 : 76; }
+            else if (g == G_GLOB) bits += 48; else bits += 96;
+        }
+        cd[c].bits = bits; cd[c].groupMask = gm; cd[c].vecMask = vm;
+    }
+    for (int a = 0; a < nc; a++) {
+        if (cd[a].dropped) continue;
+        for (int b = 0; b < nc; b++) {
+            if (a == b || cd[b].dropped || cd[a].nHits != cd[b].nHits) continue;
+            int same = 1;
+            for (int i = 0; i < cd[a].nHits && same; i++) {
+                int found = 0;
+                for (int j = 0; j < cd[b].nHits; j++) if (hits[cd[a].hit[i]].group == hits[cd[b].hit[j]].group && hits[cd[a].hit[i]].src == hits[cd[b].hit[j]].src) { found = 1; break; }
+                if (!found) same = 0;
+            }
+            if (same) cd[a].amb = 1;
+        }
+    }
+    /* rank */
+    int order[MAXH], no = 0;
+    for (int c = 0; c < nc; c++) if (!cd[c].dropped && cd[c].bits >= 24) order[no++] = c;
+    for (int i = 0; i < no; i++) for (int j = i + 1; j < no; j++) if (cd[order[j]].bits > cd[order[i]].bits) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+
+    /* liveness of the top RAM candidates: real RAM changes between two looks, a snapshot copy does not */
+    int ramTop[4], nrt = 0;
+    for (int i = 0; i < no && nrt < 4; i++) if (cd[order[i]].kind == 0) ramTop[nrt++] = order[i];
+    if (nrt > 0) {
+        snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+        int fd2 = open(path, O_RDONLY | O_CLOEXEC);
+        enum { NPG = 2048 };
+        uint64_t *before = malloc(sizeof(uint64_t) * NPG * 4);
+        unsigned char *pg = malloc(1 << 20);
+        for (int round = 0; round < 2; round++) {
+            for (int i = 0; i < nrt; i++) {
+                int changed = 0;
+                for (int blk = 0; blk < 8; blk++) {
+                    read_robust(fd2, pg, 1 << 20, cd[ramTop[i]].base + (uint64_t) blk * (1 << 20));
+                    for (int p = 0; p < 256; p++) {
+                        uint64_t h = page_hash(pg + p * 4096); size_t idx = (size_t) i * NPG + (size_t) blk * 256 + p;
+                        if (round == 0) before[idx] = h; else if (before[idx] != h) changed++;
+                    }
+                }
+                if (round == 1) cd[ramTop[i]].live = changed * 1000 / NPG;
+            }
+            if (round == 0) usleep(400000);
+        }
+        free(before); free(pg); close(fd2);
+    }
+
+    for (int i = 0; i < no; i++) {
+        FCand *c = &cd[order[i]];
+        char gs[128] = ""; int off = 0;
+        for (int g = 0; g < 4; g++) if (c->groupMask & (1 << g)) {
+            double gb = g == G_VEC ? (__builtin_popcount(c->vecMask) == 1 ? 16 : __builtin_popcount(c->vecMask) == 2 ? 36 : __builtin_popcount(c->vecMask) == 3 ? 56 : 76) : g == G_GLOB ? 48 : 96;
+            off += snprintf(gs + off, sizeof(gs) - (size_t) off, "%s%s:%.0f", off ? "," : "", G_NAME[g], gb);
+        }
+        printf("DET %s %s %" PRIx64 " %.0f %d %d %s\n", c->kind == 0 ? "ram" : "rom", TF_NAME[c->tf], c->base, c->bits, c->amb, c->kind == 0 ? c->live : -1, gs);
+    }
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("STAT %d %llu %ld\n", nr - skippedRegions, (unsigned long long) (bytesRead >> 20), (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+    printf("DONE\n");
+    for (int c = 0; c < nc; c++) free(cd[c].hit);
+    free(cd); free(hits); free(rg); free(nd); free(z); if (pmfd >= 0) close(pmfd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { printf("ERR missing command\n"); return 1; }
 
@@ -1174,6 +1521,12 @@ int main(int argc, char **argv) {
         pid_t pid = (pid_t) atoi(argv[2]);
         if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
         cmd_vnext(pid, argv[3], argv[4], argv[5], argv[6], argv[7], argv[8]);
+        return 0;
+    }
+    if (strcmp(argv[1], "findn64") == 0 && argc >= 6) {
+        pid_t pid = (pid_t) atoi(argv[2]);
+        if (pid <= 0) { printf("ERR bad pid\n"); return 1; }
+        cmd_findn64(pid, argv[3], argv[4], argv[5]);
         return 0;
     }
     if (strcmp(argv[1], "cpatch") == 0 && argc >= 6) {

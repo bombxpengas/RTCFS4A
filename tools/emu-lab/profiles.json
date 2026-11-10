@@ -1,0 +1,15 @@
+{
+ "mupen64plus+mupen64plus-rsp-hle": {
+  "laws": [
+   {
+    "arena_anonymous": true,
+    "arena_mb": 512,
+    "base_alignment": 4096,
+    "rom_minus_ram": 268435456,
+    "seen": 6,
+    "system": "n64",
+    "transform": "le32"
+   }
+  ]
+ }
+}
